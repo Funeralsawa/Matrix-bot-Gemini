@@ -34,6 +34,7 @@ var (
 	cryptoHelper      *cryptohelper.CryptoHelper
 	syncer            *mautrix.DefaultSyncer
 	chatMemory        sync.Map = sync.Map{}
+	roomLocks         sync.Map = sync.Map{}
 	bootTimeUnixmilli int64
 	workdir           string
 	searchMutex       sync.Mutex

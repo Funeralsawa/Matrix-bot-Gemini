@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"nozomi/internal/logger"
@@ -30,6 +31,38 @@ func saveQuota() {
 	}
 }
 
+func getHistoryLen(history []*genai.Content) int {
+	totalLength := 0
+	for _, content := range history {
+		if content.Role == "user" {
+			totalLength += len(content.Parts)
+		} else {
+			totalLength += 1
+		}
+	}
+	return totalLength
+}
+
+func historyCleanup(history []*genai.Content) []*genai.Content {
+	totalLength := getHistoryLen(history)
+	for totalLength > botConfig.Client.MaxMemoryLength {
+		if history[0].Role == "user" && len(history[0].Parts) > 1 {
+			history[0].Parts = history[0].Parts[1:]
+		} else {
+			history = history[1:]
+		}
+		totalLength--
+	}
+	for len(history) > 0 && history[0].Role == "model" {
+		if len(history) == 1 {
+			history = nil
+		} else {
+			history = history[1:]
+		}
+	}
+	return history
+}
+
 func evtMsg(ctx context.Context, evt *event.Event) {
 	if evt.Timestamp < bootTimeUnixmilli {
 		return
@@ -48,14 +81,49 @@ func evtMsg(ctx context.Context, evt *event.Event) {
 		return
 	}
 
+	var req string = msg.Body
+	mentionPattern := `\[.*?\]\(https://matrix\.to/#/` + regexp.QuoteMeta(string(client.UserID)) + `\)`
+	mentionRegex := regexp.MustCompile(mentionPattern)
+	req = mentionRegex.ReplaceAllString(req, "")
+	req = strings.ReplaceAll(req, string(client.UserID), "")
+	req = strings.ReplaceAll(req, "@[希]", "")
+	req = strings.ReplaceAll(req, "@希", "")
+	req = strings.ReplaceAll(req, "!c ", "")
+	req = strings.TrimSpace(req)
+	if len(req) == 0 {
+		req = "(呼叫了你(希))"
+	}
+
+	// LoadOrStore 保证了即便多个并发同时到达，也只会初始化出一把唯一的锁
+	roomLockObj, _ := roomLocks.LoadOrStore(evt.RoomID.String(), &sync.Mutex{})
+	roomLock := roomLockObj.(*sync.Mutex)
+
+	roomLock.Lock()
+	defer roomLock.Unlock()
+
+	// 取出当前房间的对话记忆
+	var history []*genai.Content
+	if val, ok := chatMemory.Load(evt.RoomID.String()); ok {
+		history = val.([]*genai.Content)
+	}
+
+	// 当前的对话内容
+	var currentTextPart *genai.Part
+
+	// 房间逻辑
 	membersResp, err := client.JoinedMembers(ctx, evt.RoomID)
 	if err != nil {
-		_ = logger.Log("error", " Failed to get room member list: "+err.Error(), logger.Options{})
+		str := "Failed to get room member list: " + err.Error()
+		_ = logger.Log("error", str, logger.Options{})
+		sendToLogRoom(str)
 		return
 	}
 	peopleNum := len(membersResp.Joined)
+	isGroup := peopleNum > 2
 	isMentioned := false
-	if peopleNum > 2 {
+	// 判断是否是群聊
+	if isGroup {
+		// 群聊逻辑
 		if strings.HasPrefix(msg.Body, "!c ") {
 			isMentioned = true
 		}
@@ -70,43 +138,47 @@ func evtMsg(ctx context.Context, evt *event.Event) {
 				}
 			}
 		}
-		if !isMentioned {
-			return
+		str := fmt.Sprintf("%s 发言：%s\n", evt.Sender.String(), req)
+		currentTextPart = genai.Text(str)[0].Parts[0]
+	} else {
+		// 私信逻辑
+		isMentioned = true
+		currentTextPart = genai.Text(req)[0].Parts[0]
+	}
+	// 防止 Gemini 连续 user 报错：合并同类项
+	historyLen := len(history)
+	if historyLen > 0 && history[historyLen-1].Role == "user" {
+		// 上一句话是人类说的（只有群聊会出现），直接把新的文本 Part 塞进上一个 user 的包裹里
+		history[historyLen-1].Parts = append(history[historyLen-1].Parts, currentTextPart)
+	} else {
+		// 上一句话是大模型的，这是一个全新的对话，创建一个新的 user 节点
+		userMsg := &genai.Content{
+			Role:  "user",
+			Parts: []*genai.Part{currentTextPart},
+		}
+		history = append(history, userMsg)
+	}
+	history = historyCleanup(history)
+	chatMemory.Store(evt.RoomID.String(), history)
+
+	if !isMentioned {
+		return
+	}
+
+	// 深拷贝一份绝对干净的历史记录给大模型，防止指针并发崩溃
+	sendHistory := make([]*genai.Content, len(history))
+	for i, h := range history {
+		partsCopy := make([]*genai.Part, len(h.Parts))
+		copy(partsCopy, h.Parts)
+		sendHistory[i] = &genai.Content{
+			Role:  h.Role,
+			Parts: partsCopy,
 		}
 	}
 
-	var req string = msg.Body
-	mentionPattern := `\[.*?\]\(https://matrix\.to/#/` + regexp.QuoteMeta(string(client.UserID)) + `\)`
-	mentionRegex := regexp.MustCompile(mentionPattern)
-	req = mentionRegex.ReplaceAllString(req, "")
-	req = strings.ReplaceAll(req, string(client.UserID), "")
-	req = strings.ReplaceAll(req, "@[希]", "")
-	req = strings.ReplaceAll(req, "@希", "")
-	req = strings.ReplaceAll(req, "!c ", "")
-	req = strings.TrimSpace(req)
-	if len(req) == 0 {
-		req = "(叫了你一下但什么也没说)"
-	}
-
-	go func(evt *event.Event, req string) {
+	go func(evt *event.Event, req string, history []*genai.Content) {
 		// 由于是独立协程，不允许再使用外部context
 		ctx := context.Background()
-
-		var history []*genai.Content
-		if val, ok := chatMemory.Load(evt.RoomID.String()); ok {
-			history = val.([]*genai.Content)
-		}
-
-		userMsg := genai.Text(req)[0]
-		userMsg.Role = "user"
-		history = append(history, userMsg)
-
-		if len(history) > botConfig.Client.MaxMemoryLength {
-			history = history[len(history)-botConfig.Client.MaxMemoryLength:]
-			for history[0].Role == "model" {
-				history = history[1:]
-			}
-		}
 
 		reqConfig := botConfig.Model.Config
 		nowMonth := time.Now().Format("2006-01")
@@ -123,6 +195,7 @@ func evtMsg(ctx context.Context, evt *event.Event) {
 		}
 		searchMutex.Unlock()
 
+		// 调用大模型
 		result, costTime, err := Call(history, reqConfig)
 		if err != nil {
 			str := "用户：" + evt.Sender.String() + "\n"
@@ -137,19 +210,14 @@ func evtMsg(ctx context.Context, evt *event.Event) {
 				str += fmt.Sprintf("大模型调用超时：%v", costTime)
 				_, _ = client.SendText(ctx, evt.RoomID, "Network congestion.Please try again later.")
 				_ = logger.Log("error", fmt.Sprintf("Call LLM time out, spent: %v", costTime), logger.Options{})
-				sendToLogRoom(str)
 			} else {
 				_, _ = client.SendText(ctx, evt.RoomID, "Sorry, I need rest.")
 				_ = logger.Log("error", fmt.Sprintf("Gemini meet a error: %s", err.Error()), logger.Options{})
 
 				str += "错误：" + err.Error()
-				sendToLogRoom(str)
 			}
 
-			if len(history) > 0 {
-				history = history[:len(history)-1]
-				chatMemory.Store(evt.RoomID.String(), history)
-			}
+			sendToLogRoom(str)
 			return
 		}
 
@@ -196,8 +264,14 @@ func evtMsg(ctx context.Context, evt *event.Event) {
 			safeModelMsg.Role = "model"
 
 			if len(safeModelMsg.Parts) > 0 {
-				history = append(history, safeModelMsg)
-				chatMemory.Store(evt.RoomID.String(), history)
+				roomLock.Lock()
+				if val, ok := chatMemory.Load(evt.RoomID.String()); ok {
+					latestHistory := val.([]*genai.Content)
+					latestHistory = append(latestHistory, safeModelMsg)
+					latestHistory = historyCleanup(latestHistory)
+					chatMemory.Store(evt.RoomID.String(), latestHistory)
+				}
+				roomLock.Unlock()
 			} else {
 				str := "The model return null value and has been inhibit.Question: " + req
 				_ = logger.Log("info", str, logger.Options{})
@@ -238,5 +312,5 @@ func evtMsg(ctx context.Context, evt *event.Event) {
 			str += "时间：" + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05")
 			sendToLogRoom(str)
 		}
-	}(evt, req)
+	}(evt, req, sendHistory)
 }
