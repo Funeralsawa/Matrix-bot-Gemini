@@ -9,7 +9,7 @@ import (
 
 func Call(history []*genai.Content, reqConfig *genai.GenerateContentConfig) (*genai.GenerateContentResponse, time.Duration, error) {
 	now := time.Now()
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, botConfig.Model.TimeOutWhen)
 	defer cancel()
 	result, err := gclient.Models.GenerateContent(
 		timeoutCtx,

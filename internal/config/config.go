@@ -1,6 +1,8 @@
 package config
 
 import (
+	"time"
+
 	"google.golang.org/genai"
 	"maunium.net/go/mautrix/id"
 )
@@ -27,6 +29,8 @@ type ModelConfig struct {
 	UseInternet      bool                         `yaml:"useInternet"`
 	SecureCheck      bool                         `yaml:"secureCheck"`
 	MaxMonthlySearch int                          `yaml:"maxMonthlySearch"`
+	TimeOutWhen      time.Duration                `yaml:"timeOutWhen"`
+	DatabasePassword string                       `yaml:"databasePassword"`
 	Soul             string                       `yaml:"-"`
 	Config           *genai.GenerateContentConfig `yaml:"-"`
 }

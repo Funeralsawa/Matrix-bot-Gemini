@@ -20,7 +20,7 @@ import (
 )
 
 func saveQuota() {
-	path := filepath.Join(workdir, "search_quota.json")
+	path := filepath.Join(workdir, "data", "search_quota.json")
 	// 使用 json.MarshalIndent 可以让生成的 JSON 文件有缩进
 	data, _ := json.MarshalIndent(quota, "", "\t")
 	err := os.WriteFile(path, data, 0644)
@@ -221,14 +221,23 @@ func evtMsg(ctx context.Context, evt *event.Event) {
 			return
 		}
 
+		inputToken := result.UsageMetadata.PromptTokenCount
+		outputToken := result.UsageMetadata.CandidatesTokenCount
+		totalToken := result.UsageMetadata.TotalTokenCount
+		thinkToken := totalToken - outputToken - inputToken
 		tokenConsume := fmt.Sprintf(
 			" | 输入%d 输出%d 总计消耗%d | %v",
-			result.UsageMetadata.PromptTokenCount,
-			result.UsageMetadata.CandidatesTokenCount,
-			result.UsageMetadata.TotalTokenCount,
+			inputToken,
+			outputToken,
+			totalToken,
 			costTime,
 		)
 		_ = logger.Log("bot", req+tokenConsume, logger.Options{UserID: evt.Sender.String(), RoomID: evt.RoomID.String()})
+		tokenMutex.Lock()
+		CheckAndResetBilling()
+		GlobalTokenUsage.Record(inputToken, outputToken, thinkToken)
+		SaveTokenUsage()
+		tokenMutex.Unlock()
 
 		if result.UsageMetadata.TotalTokenCount >= botConfig.Model.AlargmTokenCount {
 			tokenConsume = strings.TrimPrefix(tokenConsume, " | ")

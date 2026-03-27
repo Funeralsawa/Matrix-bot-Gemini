@@ -6,11 +6,10 @@ import (
 	"time"
 
 	"nozomi/internal/logger"
-
-	"maunium.net/go/mautrix"
 )
 
-func startRoomCleanupTask(client *mautrix.Client) {
+// 自动处理空房间
+func startRoomCleanupTask() {
 	ticker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
 
@@ -35,20 +34,21 @@ func startRoomCleanupTask(client *mautrix.Client) {
 			if len(membersResp.Joined) <= 1 {
 				_, err := client.LeaveRoom(ctx, roomID)
 				if err != nil {
-					str := fmt.Sprintf("Failed to exit the empty room %s with error %s", roomID, err)
+					str := fmt.Sprintf("Failed to exit the empty room %s with error %s", roomID.String(), err.Error())
 					_ = logger.Log("error", str, logger.Options{})
 					sendToLogRoom(str)
 				} else {
-					str := fmt.Sprintf("Exit the empty room %s sucessfully.", roomID)
-					str2 := fmt.Sprintf("The chat memory of room %s was deleted.", roomID)
+					str := fmt.Sprintf("Exit the empty room %s sucessfully.", roomID.String())
+					str2 := fmt.Sprintf("The chat memory of room %s was deleted.", roomID.String())
 					_ = logger.Log("info", str, logger.Options{})
 
-					chatMemory.Delete(roomID)
+					chatMemory.Delete(roomID.String())
 					if _, ok := chatMemory.Load(roomID); !ok {
 						_ = logger.Log("info", str2, logger.Options{})
 					} else {
-						str := fmt.Sprintf("Canot delete chat memory of room %s", roomID)
+						str := fmt.Sprintf("Canot delete chat memory of room %s", roomID.String())
 						_ = logger.Log("error", str, logger.Options{})
+						sendToLogRoom(str)
 					}
 				}
 			}

@@ -26,8 +26,13 @@ type SearchQuota struct {
 	Count int    `json:"count"`
 }
 
+type TimeLog struct {
+	Time time.Time `json:"Time"`
+}
+
 var (
 	ctx               context.Context = context.Background()
+	timeLog           TimeLog
 	client            *mautrix.Client
 	gclient           *genai.Client
 	botConfig         config.BotConfig
@@ -39,6 +44,8 @@ var (
 	workdir           string
 	searchMutex       sync.Mutex
 	quota             SearchQuota
+	GlobalTokenUsage  ConsumeToken
+	tokenMutex        sync.Mutex // 专门保护账单并发写入的锁
 )
 
 func IsExist(path string) (bool, error) {
@@ -103,7 +110,18 @@ func createDirOrFile() {
 		}
 		log.Println("Create database path sucessfully.")
 	}
-	quotaPath := filepath.Join(workdir, "search_quota.json")
+	dataPath := filepath.Join(workdir, "data")
+	ok, _ = IsExist(dataPath)
+	if !ok {
+		log.Println("dataPath does not exist, auto creating at " + dataPath)
+		err := os.Mkdir(dataPath, 0777)
+		if err != nil {
+			log.Println("Auto creating dataPath failed: " + err.Error())
+			os.Exit(1)
+		}
+		log.Println("Create data path sucessfully.")
+	}
+	quotaPath := filepath.Join(workdir, "data", "search_quota.json")
 	ok, _ = IsExist(quotaPath)
 	if !ok {
 		log.Println("search_quota.json does not exist, creating...")
@@ -118,33 +136,34 @@ func createDirOrFile() {
 			os.Exit(1)
 		}
 		log.Println("Create search_quota.json sucessfully.")
+	}
+	tokenUsagePath := filepath.Join(workdir, "data", "token_usage.json")
+	ok, _ = IsExist(tokenUsagePath)
+	if !ok {
+		log.Println("token_usage.json does not exist, creating...")
+		defaultUsage := ConsumeToken{}
+		bytes, _ := json.MarshalIndent(defaultUsage, "", "\t")
+		err := os.WriteFile(tokenUsagePath, bytes, 0644)
+		if err != nil {
+			log.Println("Auto creating token_usage.json failed: " + err.Error())
+			os.Exit(1)
+		}
+		log.Println("Create token_usage.json sucessfully.")
+	}
+	timePath := filepath.Join(workdir, "data", "time.json")
+	ok, _ = IsExist(timePath)
+	if !ok {
+		log.Println("time.json does not exist, creating...")
+		defaultTime := TimeLog{Time: time.Now()}
+		bytes, _ := json.MarshalIndent(defaultTime, "", "\t")
+		err := os.WriteFile(timePath, bytes, 0644)
+		if err != nil {
+			log.Println("Auto creating time.json failed: " + err.Error())
+			os.Exit(1)
+		}
+		log.Println("Create time.json sucessfully.")
 		log.Println("All config file has created.Pls check no file is empty.")
 		os.Exit(0)
-	}
-}
-
-func sendToLogRoom(info string) {
-	joinedRoomsResp, err := client.JoinedRooms(ctx)
-	if err != nil {
-		_ = logger.Log("error", "Failed to get room list when send text to log rooms. "+err.Error(), logger.Options{})
-		return
-	}
-
-	joinedMap := make(map[id.RoomID]bool)
-	for _, roomID := range joinedRoomsResp.JoinedRooms {
-		joinedMap[roomID] = true
-	}
-
-	for _, room := range botConfig.Client.LogRoom {
-		targetRoom := id.RoomID(room)
-		if !joinedMap[targetRoom] {
-			str := "Sending text to log room fail.No such room " + string(room)
-			_ = logger.Log("info", str, logger.Options{})
-			continue
-		}
-		if _, err := client.SendText(ctx, targetRoom, info); err != nil {
-			_ = logger.Log("error", "Sending text to log room fail.", logger.Options{})
-		}
 	}
 }
 
@@ -224,7 +243,8 @@ func Start() {
 	}
 
 	databasePath := filepath.Join(workdir, "database", "bot_crypto.db")
-	cryptoHelper, err = cryptohelper.NewCryptoHelper(client, []byte("625890"), databasePath)
+	password := botConfig.Model.DatabasePassword
+	cryptoHelper, err = cryptohelper.NewCryptoHelper(client, []byte(password), databasePath)
 	if err != nil {
 		_ = logger.Log("error", "Failed to initialize crypto module: "+err.Error(), logger.Options{})
 		os.Exit(1)
@@ -238,8 +258,23 @@ func Start() {
 
 	bootTimeUnixmilli = time.Now().UnixMilli()
 
+	// Init time.json
+	path := filepath.Join(workdir, "data", "time.json")
+	timeData, err := os.ReadFile(path)
+	if err != nil {
+		str := "Failed to read time.json." + err.Error()
+		logger.Log("error", str, logger.Options{})
+		os.Exit(1)
+	}
+	err = json.Unmarshal(timeData, &timeLog)
+	if err != nil {
+		str := "Failed to unmarshal time.json data." + err.Error()
+		logger.Log("error", str, logger.Options{})
+		os.Exit(1)
+	}
+
 	// Init search_quota.json
-	path := filepath.Join(workdir, "search_quota.json")
+	path = filepath.Join(workdir, "data", "search_quota.json")
 	quotaData, err := os.ReadFile(path)
 	if err != nil {
 		str := "Failed to read search_quota.json." + err.Error()
@@ -253,10 +288,14 @@ func Start() {
 		os.Exit(1)
 	}
 
+	// Init token_usage.json
+	LoadTokenUsage()
+
 	syncer = client.Syncer.(*mautrix.DefaultSyncer)
+
 	defer cryptoHelper.Close()
 
-	syncer.OnEventType(event.StateMember, AutoAcceptInvite)
+	syncer.OnEventType(event.StateMember, EvtMember)
 	syncer.OnEventType(event.EventEncrypted, func(ctx context.Context, evt *event.Event) {
 		if evt.Timestamp < bootTimeUnixmilli {
 			return
@@ -264,7 +303,9 @@ func Start() {
 	})
 	syncer.OnEventType(event.EventMessage, evtMsg)
 
-	go startRoomCleanupTask(client)
+	go startRoomCleanupTask()    //GC_1
+	go clearNonExistRoomMemory() //GC_2
+	go startBillingCheckTask()
 
 	log.Printf("Robot sucessfully initialize! %s now is runing!", client.UserID.String())
 	_ = logger.Log("info", "Robot init sucessfully.", logger.Options{})
