@@ -19,6 +19,8 @@ type ClientConfig struct {
 	DeviceID        id.UserID `yaml:"deviceID"`
 	LogRoom         []string  `yaml:"logRoom"`
 	MaxMemoryLength int       `yaml:"maxMemoryLength"`
+	AvatarURL       string    `yaml:"avatarURL"`
+	DisplayName     string    `yaml:"displayName"`
 }
 
 type ModelConfig struct {

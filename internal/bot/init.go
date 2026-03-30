@@ -326,6 +326,7 @@ func Start() {
 	go startRoomCleanupTask()       //GC_1
 	go clearNonExistRoomMemory()    //GC_2
 	go startImageCacheCleanupTask() //GC_3
+	go startProfileKeeperTask()
 	go startBillingCheckTask()
 
 	log.Printf("Robot sucessfully initialize! %s now is runing!", client.UserID.String())
