@@ -79,7 +79,9 @@ func (c *Client) ParseMessage(ctx context.Context, evt *event.Event) (*MessageCo
 		return nil, fmt.Errorf("not a message event")
 	}
 
-	if msg.MsgType != event.MsgText && msg.MsgType != event.MsgImage {
+	isSticker := evt.Type == event.EventSticker
+
+	if !isSticker && msg.MsgType != event.MsgText && msg.MsgType != event.MsgImage {
 		return nil, fmt.Errorf("not a message event")
 	}
 
@@ -92,28 +94,44 @@ func (c *Client) ParseMessage(ctx context.Context, evt *event.Event) (*MessageCo
 		req = fmt.Sprintf("(引用回复了：“%s”)\n%s", quote, reply)
 	} else if msg.RelatesTo != nil && msg.RelatesTo.InReplyTo != nil {
 		// 处理 MSC2802 原生回复
-		origText, err := c.fetchAndDecryptRemoteEvent(ctx, evt.RoomID, msg.RelatesTo.InReplyTo.EventID)
+		e, err := c.fetchAndDecryptRemoteEvent(ctx, evt.RoomID, msg.RelatesTo.InReplyTo.EventID)
 		if err != nil {
 			return nil, err
 		}
-		if origText != "" {
-			req = fmt.Sprintf("(引用回复了：“%s”)\n%s", origText, req)
+		m := e.Content.AsMessage()
+		if m != nil {
+			_, pureRemoteText := c.extractReply(m.Body) //剥离历史信息本身的引用
+			if pureRemoteText != "" {
+				quote = pureRemoteText
+				reply = req
+				req = fmt.Sprintf("(引用回复了：“%s”)\n%s", quote, req)
+				res.IsMentioned = e.Sender == c.client.UserID
+			}
 		}
 	}
 
 	// 2. 处理图片与解密
-	if msg.MsgType == event.MsgImage {
+	if msg.MsgType == event.MsgImage || isSticker {
 		imgData, mime := c.downloadAndDecryptImage(ctx, msg)
 		if len(imgData) > 0 {
+			compressedImg, finalMime, _ := c.CompressImageTo720p(imgData)
+			imgData = compressedImg
+			mime = finalMime
 			res.ImagePart = &genai.Part{
 				InlineData: &genai.Blob{MIMEType: mime, Data: imgData},
 			}
-			req = c.sniffImageCaption(req) // 嗅探文件名占位符
+			if isSticker {
+				req = "(发送了一张贴纸)"
+			} else {
+				req = c.sniffImageCaption(req) // 嗅探并清理常规图片文件名占位符
+			}
 		}
 	}
 
 	// 3. 艾特判定与清理
-	res.IsMentioned = c.checkMention(evt, req)
+	if !res.IsMentioned {
+		res.IsMentioned = c.checkMention(evt, quote, reply)
+	}
 	res.Text = c.cleanMentionAndCmd(req)
 
 	return res, nil
@@ -231,33 +249,35 @@ func (c *Client) downloadAndDecryptImage(ctx context.Context, msg *event.Message
 	return data, mime
 }
 
-func (c *Client) fetchAndDecryptRemoteEvent(ctx context.Context, roomID id.RoomID, eventID id.EventID) (string, error) {
+func (c *Client) fetchAndDecryptRemoteEvent(ctx context.Context, roomID id.RoomID, eventID id.EventID) (*event.Event, error) {
 	evt, err := c.client.GetEvent(ctx, roomID, eventID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if evt.Type == event.EventEncrypted && c.crypto != nil {
 		err = evt.Content.ParseRaw(evt.Type) // 将 Raw JSON 反序列化为底层解密引擎需要的结构体
 		if err != nil && !errors.Is(err, event.ErrContentAlreadyParsed) {
-			return "", err
+			return nil, err
 		}
 		dec, err := c.crypto.Decrypt(ctx, evt)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		evt = dec
 	}
-	m := evt.Content.AsMessage()
-	if m == nil {
-		return "", nil
-	}
-	_, reply := c.extractReply(m.Body) // 剥离历史消息本身的引用
-	return reply, nil
+	return evt, nil
 }
 
-func (c *Client) checkMention(evt *event.Event, body string) bool {
-	if strings.Contains(body, string(c.client.UserID)) || strings.Contains(body, "!c") {
+func (c *Client) checkMention(evt *event.Event, quote, reply string) bool {
+	if strings.Contains(reply, string(c.client.UserID)) || strings.Contains(reply, "!c") {
 		return true
+	}
+	regexEngine := regexp.MustCompile(`<([^>]+)>`)
+	matches := regexEngine.FindStringSubmatch(quote)
+	if len(matches) > 1 {
+		// matches[0] 是 "<@bot:sigh.work>"
+		// matches[1] 是 "@bot:sigh.work"
+		return matches[1] == c.client.UserID.String()
 	}
 	msg := evt.Content.AsMessage()
 	if msg.Mentions != nil {

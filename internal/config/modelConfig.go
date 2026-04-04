@@ -18,6 +18,8 @@ type ModelConfig struct {
 	IncludeThoughts  bool                         `yaml:"includeThoughts"`
 	ThinkingBudget   int32                        `yaml:"thinkingBudget"`
 	ThinkingLevel    string                       `yaml:"thinkingLevel"`
+	Rate             float64                      `yaml:"rate"`
+	RateBurst        int                          `yaml:"rateBurst"`
 	Soul             string                       `yaml:"-"`
 	Config           *genai.GenerateContentConfig `yaml:"-"`
 }

@@ -12,19 +12,21 @@ import (
 	"nozomi/internal/matrix"
 	"nozomi/internal/memory"
 	"nozomi/internal/quota"
+	"nozomi/internal/ratelimit"
 
 	"maunium.net/go/mautrix/event"
 )
 
 type App struct {
-	Config  *config.BotConfig
-	Logger  *logger.Logger
-	Matrix  *matrix.Client
-	LLM     *llm.Client
-	Memory  *memory.Manager
-	Billing *billing.System
-	Router  *handler.Router
-	Quota   *quota.Manager
+	Config      *config.BotConfig
+	Logger      *logger.Logger
+	Matrix      *matrix.Client
+	LLM         *llm.Client
+	Memory      *memory.Manager
+	Billing     *billing.System
+	Router      *handler.Router
+	Quota       *quota.Manager
+	RateManager *ratelimit.RateManager
 }
 
 func NewApp(cfg *config.BotConfig) (*App, error) {
@@ -52,18 +54,22 @@ func NewApp(cfg *config.BotConfig) (*App, error) {
 	// 初始化 logger 日志记录器
 	logger := logger.NewLogger(cfg)
 
+	// 初始化 rateManager API限流
+	rateManager := ratelimit.NewRateManager(cfg.Model.Rate, cfg.Model.RateBurst)
+
 	app := &App{
-		Config:  cfg,
-		Logger:  logger,
-		Matrix:  matrixClient,
-		LLM:     llmClient,
-		Memory:  memMgr,
-		Billing: billSys,
-		Quota:   quota,
+		Config:      cfg,
+		Logger:      logger,
+		Matrix:      matrixClient,
+		LLM:         llmClient,
+		Memory:      memMgr,
+		Billing:     billSys,
+		Quota:       quota,
+		RateManager: rateManager,
 	}
 
 	// 注册核心业务路由器
-	app.Router = handler.NewRouter(app.Matrix, app.LLM, app.Memory, app.Billing, cfg, logger, quota)
+	app.Router = handler.NewRouter(app.Matrix, app.LLM, app.Memory, app.Billing, cfg, logger, quota, rateManager)
 
 	return app, nil
 }

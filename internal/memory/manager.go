@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"google.golang.org/genai"
+	"maunium.net/go/mautrix/id"
 )
 
 type ImageCacheItem struct {
@@ -17,6 +18,7 @@ type ImageCacheItem struct {
 type Manager struct {
 	chatMemory        sync.Map // 格式: map[string][]*genai.Content
 	privateImageCache sync.Map // 格式: map[string]*ImageCacheItem
+	summarizingRooms  sync.Map // 格式: map[string]struct{}
 	roomLocks         sync.Map // 格式: map[string]*sync.Mutex
 	maxMemoryLength   int      // 记忆最大长度（图纸配置）
 }
@@ -102,7 +104,7 @@ func (m *Manager) AddUserMsgAndLoad(roomID string, text string, imgPart *genai.P
 	}
 
 	// 裁切并保存到原始内存
-	history = m.cleanup(history)
+	history = m.cleanup(roomID, history)
 	m.chatMemory.Store(roomID, history)
 
 	// 返回一份深拷贝给独立协程，防止指针被并发踩踏
@@ -129,7 +131,7 @@ func (m *Manager) AddModelMsg(roomID string, cleanParts []*genai.Part) {
 	}
 
 	history = append(history, safeModelMsg)
-	history = m.cleanup(history)
+	history = m.cleanup(roomID, history)
 	m.chatMemory.Store(roomID, history)
 }
 
@@ -217,7 +219,7 @@ func (m *Manager) Store(roomID string, history []*genai.Content) {
 	defer m.getRoomLock(roomID).Unlock()
 
 	// 调用内部的私有滑动窗口清理函数
-	cleanHistory := m.cleanup(history)
+	cleanHistory := m.cleanup(roomID, history)
 	m.chatMemory.Store(roomID, cleanHistory)
 }
 
@@ -241,8 +243,110 @@ func (m *Manager) deepCopy(rawHistory []*genai.Content) []*genai.Content {
 	return history
 }
 
+func (m *Manager) TryLockRoomSummarization(roomID id.RoomID) bool {
+	_, loaded := m.summarizingRooms.LoadOrStore(roomID.String(), struct{}{})
+	return !loaded
+}
+
+func (m *Manager) UnlockRoomSummarization(roomID id.RoomID) {
+	m.summarizingRooms.Delete(roomID.String())
+}
+
+// 记忆总结回传算法
+func (m *Manager) MemoryRetrospection(roomID id.RoomID, conclusion []*genai.Part, summarizedPartCount int) error {
+	m.getRoomLock(roomID.String()).Lock()
+	defer m.getRoomLock(roomID.String()).Unlock()
+
+	h, ok := m.chatMemory.Load(roomID.String())
+	if !ok {
+		return fmt.Errorf("This room has no memory record.")
+	}
+	nowHistory := h.([]*genai.Content)
+
+	if summarizedPartCount <= 0 {
+		return nil
+	}
+
+	var newHistory []*genai.Content
+	newHistory = append(newHistory, &genai.Content{
+		Role:  "user",
+		Parts: conclusion,
+	})
+
+	k := 0
+	for i := 0; i < len(nowHistory); i++ {
+		if nowHistory[i].Role == "model" {
+			if k >= summarizedPartCount {
+				newHistory = m.appendContentSafely(newHistory, nowHistory[i])
+			}
+			k++
+			continue
+		}
+
+		content := &genai.Content{Role: "user"}
+		for j := 0; j < len(nowHistory[i].Parts); j++ {
+			if k >= summarizedPartCount {
+				content.Parts = append(content.Parts, nowHistory[i].Parts[j])
+			}
+			k++
+		}
+
+		if len(content.Parts) > 0 {
+			newHistory = m.appendContentSafely(newHistory, content)
+		}
+	}
+
+	m.chatMemory.Store(roomID.String(), newHistory)
+	return nil
+}
+
+func (m *Manager) appendContentSafely(history []*genai.Content, newContent *genai.Content) (mergedHistory []*genai.Content) {
+	if len(history) == 0 {
+		return append(history, newContent)
+	}
+	lastIndex := len(history) - 1
+	if history[lastIndex].Role == newContent.Role {
+		history[lastIndex].Parts = append(history[lastIndex].Parts, newContent.Parts...)
+		return history
+	}
+	return append(history, newContent)
+}
+
+// 获取旧记忆，返回旧记忆与记忆数量
+func (m *Manager) GetOldHistory(history []*genai.Content) ([]*genai.Content, int) {
+	totalLen := m.GetHistoryLen(history)
+	if totalLen <= 6 {
+		return nil, 0
+	}
+	var h []*genai.Content
+	contentlLen := len(history)
+	targetLen := totalLen - 6
+	if targetLen <= 0 {
+		return nil, 0
+	}
+	k := 0
+	for i := 0; i < contentlLen && k < targetLen; i++ {
+		if history[i].Role == "model" {
+			h = append(h, history[i])
+			k++
+			continue
+		}
+		content := &genai.Content{
+			Role: "user",
+		}
+		for j := 0; j < len(history[i].Parts) && k < targetLen; j++ {
+			content.Parts = append(content.Parts, history[i].Parts[j])
+			k++
+		}
+		if len(content.Parts) > 0 {
+			h = append(h, content)
+		}
+	}
+	return h, k
+}
+
 // 获取记忆长度
-func getHistoryLen(history []*genai.Content) int {
+func (m *Manager) GetHistoryLen(history []*genai.Content) int {
 	totalLength := 0
 	for _, content := range history {
 		if content.Role == "user" {
@@ -255,8 +359,11 @@ func getHistoryLen(history []*genai.Content) int {
 }
 
 // 滑动窗口裁剪逻辑
-func (m *Manager) cleanup(history []*genai.Content) []*genai.Content {
-	totalLength := getHistoryLen(history)
+func (m *Manager) cleanup(roomID string, history []*genai.Content) []*genai.Content {
+	if _, summarizing := m.summarizingRooms.Load(roomID); summarizing {
+		return history
+	}
+	totalLength := m.GetHistoryLen(history)
 	for totalLength > m.maxMemoryLength {
 		if history[0].Role == "user" && len(history[0].Parts) > 1 {
 			history[0].Parts = history[0].Parts[1:]

@@ -20,7 +20,7 @@ type GenerateResult struct {
 	CostTime   time.Duration
 }
 
-// TokenUsage 封装 Token 消耗，用于极度安全地交给 Billing 领域算账
+// TokenUsage 封装 Token 消耗，用于安全地交给 Billing 领域算账
 type TokenUsage struct {
 	Input  int32
 	Output int32
@@ -42,7 +42,7 @@ func NewClient(botCfg *config.BotConfig) (*Client, error) {
 		return nil, err
 	}
 
-	// 极其精妙的装配大模型参数
+	// 装配大模型参数
 	botCfg.Model.Config = &genai.GenerateContentConfig{
 		MaxOutputTokens:   botCfg.Model.MaxOutputToken,
 		SystemInstruction: genai.Text(botCfg.Model.Soul)[0],

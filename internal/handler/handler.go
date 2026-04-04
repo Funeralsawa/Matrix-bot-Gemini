@@ -14,6 +14,7 @@ import (
 	"nozomi/internal/matrix"
 	"nozomi/internal/memory"
 	"nozomi/internal/quota"
+	"nozomi/internal/ratelimit"
 
 	"google.golang.org/genai"
 	"maunium.net/go/mautrix/event"
@@ -21,26 +22,28 @@ import (
 )
 
 type Router struct {
-	matrix   *matrix.Client
-	llm      *llm.Client
-	memory   *memory.Manager
-	billing  *billing.System
-	cfg      *config.BotConfig
-	logger   *logger.Logger
-	quota    *quota.Manager
-	bootTime time.Time // 用于过滤启动前的历史陈旧消息
+	matrix      *matrix.Client
+	llm         *llm.Client
+	memory      *memory.Manager
+	billing     *billing.System
+	cfg         *config.BotConfig
+	logger      *logger.Logger
+	quota       *quota.Manager
+	rateManager *ratelimit.RateManager
+	bootTime    time.Time // 用于过滤启动前的历史陈旧消息
 }
 
-func NewRouter(m *matrix.Client, l *llm.Client, mem *memory.Manager, b *billing.System, cfg *config.BotConfig, logger *logger.Logger, quota *quota.Manager) *Router {
+func NewRouter(m *matrix.Client, l *llm.Client, mem *memory.Manager, b *billing.System, cfg *config.BotConfig, logger *logger.Logger, quota *quota.Manager, rateManager *ratelimit.RateManager) *Router {
 	return &Router{
-		matrix:   m,
-		llm:      l,
-		memory:   mem,
-		billing:  b,
-		cfg:      cfg,
-		logger:   logger,
-		quota:    quota,
-		bootTime: time.Now(),
+		matrix:      m,
+		llm:         l,
+		memory:      mem,
+		billing:     b,
+		cfg:         cfg,
+		logger:      logger,
+		quota:       quota,
+		rateManager: rateManager,
+		bootTime:    time.Now(),
 	}
 }
 
@@ -76,6 +79,18 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 	sender := evt.Sender.String()
 	evtTime := time.UnixMilli(evt.Timestamp).Format("2006/01/02 15:04")
 
+	if !r.rateManager.AllowRequest(sender) {
+		str := "拦截到高频请求：\n"
+		str += "房间：" + roomID + "\n"
+		str += "用户：" + sender
+		errs := r.matrix.SendToLogRoom(ctx, str)
+		for _, err := range errs {
+			r.logger.Log("error", "Failed to send log to log-room: "+err.Error(), logger.Options{})
+		}
+		r.logger.Log("info", "Intercepted abnormally high frequency requests.", logger.Options{})
+		return
+	}
+
 	// 4. 调用 Matrix 领域获取房间人数，判定聊天类型
 	memberCount, err := r.matrix.GetRoomMemberCount(ctx, roomID)
 	if err != nil {
@@ -103,7 +118,7 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		msgCtx.Text = fmt.Sprintf("[%s] %s\n", evtTime, msgCtx.Text)
 	}
 
-	// 5. 委托 Memory 领域：记录群友说的话，并取出极其安全的上下文深拷贝
+	// 5. 委托 Memory 领域：记录群友说的话，并取出安全的上下文深拷贝
 	history := r.memory.AddUserMsgAndLoad(roomID, msgCtx.Text, msgCtx.ImagePart)
 
 	// 6. 如果没有关键字，只记入记忆
@@ -186,7 +201,44 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		// 9. 委托 Memory 领域：将大模型的纯净回复写入记忆
 		r.memory.AddModelMsg(roomID, res.CleanParts)
 
-		// 10. 委托 Matrix 领域：将富文本渲染并发送到房间
+		// 10. 确认是否需要执行记忆回传算法
+		nowHistoryLen := r.memory.GetHistoryLen(safeHistory)
+		needMemoryRetrospection := nowHistoryLen >= r.cfg.Client.MaxMemoryLength && !isGroup
+		if needMemoryRetrospection && r.memory.TryLockRoomSummarization(evt.RoomID) {
+			oldH, summarizedPartCount := r.memory.GetOldHistory(safeHistory)
+			go func(oldH []*genai.Content, sumCount int, roomID id.RoomID) {
+				defer r.memory.UnlockRoomSummarization(evt.RoomID)
+				bgCtx := context.Background()
+				str := "简要总结这段聊天记录的内容，不超过300字。"
+				dynamicConfig := r.cfg.Model.Config
+				if r.quota.CheckAndGetRemaining() <= 0 {
+					dynamicConfig = r.llm.GetConfigWithoutSearch()
+				}
+				dynamicConfig.SystemInstruction = genai.Text(str)[0]
+				var res *llm.GenerateResult
+				var usage *llm.TokenUsage
+				var err error
+				for retry := 0; retry < 3; retry++ {
+					res, usage, err = r.llm.Generate(bgCtx, oldH, dynamicConfig)
+					if err != nil {
+						time.Sleep(time.Second * 2)
+						continue
+					}
+					break
+				}
+				if res.UsedSearch {
+					r.quota.Consume()
+				}
+				r.billing.Record(usage.Input, usage.Output, usage.Think)
+				err = r.memory.MemoryRetrospection(roomID, res.CleanParts, sumCount)
+				if err != nil {
+					str := fmt.Sprintf("Memort Retrospection for room %s failed: %v", evt.RoomID, err)
+					r.logger.Log("error", str, logger.Options{})
+				}
+			}(oldH, summarizedPartCount, evt.RoomID)
+		}
+
+		// 11. 委托 Matrix 领域：将富文本渲染并发送到房间
 		err = r.matrix.SendMarkdown(bgCtx, rID, res.RawText)
 		if err != nil {
 			str := "用户：" + evt.Sender.String() + "\n"
