@@ -59,7 +59,7 @@ func (m *Manager) Load(roomID string) []*genai.Content {
 }
 
 // AddUserMsgAndLoad 记录群友的新发言，并返回用于大模型调用的深拷贝记忆
-func (m *Manager) AddUserMsgAndLoad(roomID string, text string, imgPart *genai.Part) []*genai.Content {
+func (m *Manager) AddUserMsgAndLoad(roomID string, text string, imgPart ...*genai.Part) []*genai.Content {
 	m.getRoomLock(roomID).Lock()
 	defer m.getRoomLock(roomID).Unlock()
 
@@ -82,7 +82,7 @@ func (m *Manager) AddUserMsgAndLoad(roomID string, text string, imgPart *genai.P
 		currentParts = append(currentParts, genai.Text(text)[0].Parts[0])
 	}
 	if imgPart != nil {
-		currentParts = append(currentParts, imgPart)
+		currentParts = append(currentParts, imgPart...)
 	}
 
 	if len(currentParts) == 0 {

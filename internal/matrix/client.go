@@ -2,6 +2,7 @@ package matrix
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -20,9 +21,13 @@ import (
 
 // MessageContext 结构化解析后的消息，供 handler 直接调度
 type MessageContext struct {
-	Text        string      // 清洗后的纯文本
-	ImagePart   *genai.Part // 解密后的图片数据（如果有）
-	IsMentioned bool        // 是否被提及
+	Sender                 id.UserID
+	Text                   string      // 清洗后的纯文本
+	ImagePart              *genai.Part // 解密后的图片数据（如果有）
+	FileName               string      // 图片名（如果有）
+	IsMentioned            bool        // 是否被提及
+	EventTime              int64       // 事件物理毫秒时间戳
+	IsUnsupportedImageType bool        // 图片格式是否被支持
 }
 
 type Client struct {
@@ -73,68 +78,93 @@ func (c *Client) OnEvent(evtType event.Type, handler func(context.Context, *even
 }
 
 // ParseMessage 核心：处理解密、嵌套剥离、多模态提取
-func (c *Client) ParseMessage(ctx context.Context, evt *event.Event) (*MessageContext, error) {
+func (c *Client) ParseMessage(ctx context.Context, evt *event.Event, u int) ([]*MessageContext, error) {
+	isSticker := evt.Type == event.EventSticker
 	msg := evt.Content.AsMessage()
 	if msg == nil {
-		return nil, fmt.Errorf("not a message event")
+		if isSticker {
+			msg = &event.MessageEventContent{}
+			rawBytes, marshalErr := json.Marshal(evt.Content.Raw)
+			if marshalErr == nil {
+				_ = json.Unmarshal(rawBytes, msg)
+			}
+		} else {
+			return nil, fmt.Errorf("not a message event")
+		}
 	}
-
-	isSticker := evt.Type == event.EventSticker
 
 	if !isSticker && msg.MsgType != event.MsgText && msg.MsgType != event.MsgImage {
 		return nil, fmt.Errorf("not a message event")
 	}
 
-	res := &MessageContext{}
+	res := []*MessageContext{}
+	msgCtx := &MessageContext{}
 	req := msg.Body
 
 	// 1. 处理引用与嵌套
-	quote, reply := c.extractReply(req)
-	if quote != "" {
-		req = fmt.Sprintf("(引用回复了：“%s”)\n%s", quote, reply)
-	} else if msg.RelatesTo != nil && msg.RelatesTo.InReplyTo != nil {
+	currentQuote, currentReply := c.extractReply(req)
+	if u < 3 && msg.RelatesTo != nil && msg.RelatesTo.InReplyTo != nil {
 		// 处理 MSC2802 原生回复
-		e, err := c.fetchAndDecryptRemoteEvent(ctx, evt.RoomID, msg.RelatesTo.InReplyTo.EventID)
-		if err != nil {
-			return nil, err
+		e, fetchErr := c.fetchAndDecryptRemoteEvent(ctx, evt.RoomID, msg.RelatesTo.InReplyTo.EventID)
+		if fetchErr != nil {
+			return nil, fetchErr
 		}
-		m := e.Content.AsMessage()
-		if m != nil {
-			_, pureRemoteText := c.extractReply(m.Body) //剥离历史信息本身的引用
-			if pureRemoteText != "" {
-				quote = pureRemoteText
-				reply = req
-				req = fmt.Sprintf("(引用回复了：“%s”)\n%s", quote, req)
-				res.IsMentioned = e.Sender == c.client.UserID
+		if e != nil {
+			lastMsgCtx, err := c.ParseMessage(ctx, e, u+1)
+			if err != nil {
+				return nil, err
+			}
+			res = append(res, lastMsgCtx...)
+			if e.Sender == c.client.UserID {
+				msgCtx.IsMentioned = true
 			}
 		}
 	}
 
 	// 2. 处理图片与解密
-	if msg.MsgType == event.MsgImage || isSticker {
-		imgData, mime := c.downloadAndDecryptImage(ctx, msg)
-		if len(imgData) > 0 {
-			compressedImg, finalMime, _ := c.CompressImageTo720p(imgData)
-			imgData = compressedImg
-			mime = finalMime
-			res.ImagePart = &genai.Part{
-				InlineData: &genai.Blob{MIMEType: mime, Data: imgData},
-			}
-			if isSticker {
-				req = "(发送了一张贴纸)"
-			} else {
-				req = c.sniffImageCaption(req) // 嗅探并清理常规图片文件名占位符
-			}
-		}
+	var err error
+	msgCtx.ImagePart, req, msgCtx.FileName, msgCtx.IsUnsupportedImageType, err = c.imageHandel(ctx, evt, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// 3. 艾特判定与清理
-	if !res.IsMentioned {
-		res.IsMentioned = c.checkMention(evt, quote, reply)
+	if !msgCtx.IsMentioned {
+		msgCtx.IsMentioned = c.checkMention(evt, currentQuote, currentReply)
 	}
-	res.Text = c.cleanMentionAndCmd(req)
+	msgCtx.Text = c.cleanMentionAndCmd(req)
+	msgCtx.Sender = evt.Sender
+	msgCtx.EventTime = evt.Timestamp
+	res = append(res, msgCtx)
 
 	return res, nil
+}
+
+func (c *Client) imageHandel(ctx context.Context, evt *event.Event, originalReq string) (imagePart *genai.Part, req string, filename string, isUnsupportedImageType bool, err error) {
+	req = originalReq
+	isSticker := evt.Type == event.EventSticker
+	msg := evt.Content.AsMessage()
+	if msg.MsgType == event.MsgImage || isSticker {
+		imgData, mime := c.downloadAndDecryptImage(ctx, msg)
+		filename = msg.FileName
+		if mime == "image/gif" {
+			return nil, req, filename, true, nil
+		}
+		if len(imgData) > 0 && mime != "image/gif" {
+			compressedImg, finalMime, _ := c.CompressImageTo720p(imgData)
+			imgData = compressedImg
+			mime = finalMime
+			imagePart = &genai.Part{
+				InlineData: &genai.Blob{MIMEType: mime, Data: imgData},
+			}
+			if isSticker {
+				req = fmt.Sprintf("(发送了一张贴纸 %s)", filename)
+			} else {
+				req = c.sniffImageCaption(req, filename) // 嗅探并清理常规图片文件名占位符
+			}
+		}
+	}
+	return imagePart, req, filename, false, nil
 }
 
 // SendMarkdown 封装 HTML 渲染与格式清洗
@@ -298,13 +328,13 @@ func (c *Client) cleanMentionAndCmd(raw string) string {
 	return strings.TrimSpace(res)
 }
 
-func (c *Client) sniffImageCaption(req string) string {
+func (c *Client) sniffImageCaption(req, filename string) string {
 	lower := strings.ToLower(req)
 	isFilename := (strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".jpeg")) && !strings.Contains(req, " ")
 	if len(req) == 0 || isFilename {
-		return "(发送了一张图片)"
+		return fmt.Sprintf("(发送了一张图片 %s)", filename)
 	}
-	return "(发送了一张图片并配文) " + req
+	return fmt.Sprintf("(发送了一张图片 %s 并配文) %s ", filename, req)
 }
 
 // 资料自愈支持
