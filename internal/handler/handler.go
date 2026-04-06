@@ -200,7 +200,7 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		if r.billing.CheckAlarm(usage.Input + usage.Output + usage.Think) {
 			str := "用量警报！\n"
 			str += "用户：" + sender.String() + "\n"
-			str += "房间：" + sender.String() + "\n"
+			str += "房间：" + rID.String() + "\n"
 			str += "请求：" + text + "\n"
 			str += "时间: " + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
 			str += "Token 账单单次达到警报值！\n"

@@ -132,7 +132,8 @@ func (c *Client) ParseMessage(ctx context.Context, evt *event.Event, u int) ([]*
 	if !msgCtx.IsMentioned {
 		msgCtx.IsMentioned = c.checkMention(evt, currentQuote, currentReply)
 	}
-	msgCtx.Text = c.cleanMentionAndCmd(req)
+	_, reply := c.extractReply(req)
+	msgCtx.Text = c.cleanMentionAndCmd(reply)
 	msgCtx.Sender = evt.Sender
 	msgCtx.EventTime = evt.Timestamp
 	res = append(res, msgCtx)
