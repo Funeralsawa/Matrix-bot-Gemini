@@ -16,17 +16,19 @@ type ImageCacheItem struct {
 }
 
 type Manager struct {
-	chatMemory        sync.Map // 格式: map[string][]*genai.Content
-	privateImageCache sync.Map // 格式: map[string]*ImageCacheItem
-	summarizingRooms  sync.Map // 格式: map[string]struct{}
-	roomLocks         sync.Map // 格式: map[string]*sync.Mutex
-	maxMemoryLength   int      // 记忆最大长度（图纸配置）
+	chatMemory            sync.Map // 格式: map[string][]*genai.Content
+	privateImageCache     sync.Map // 格式: map[string]*ImageCacheItem
+	summarizingRooms      sync.Map // 格式: map[string]struct{}
+	roomLocks             sync.Map // 格式: map[string]*sync.Mutex
+	maxMemoryLength       int      // 记忆最大长度（图纸配置）
+	whenRetroRemainMemLen int      // 记忆回传算法执行时留下的记忆长度
 }
 
 // 构造函数
-func NewManager(maxLength int) *Manager {
+func NewManager(maxLength int, maxRemainLen int) *Manager {
 	return &Manager{
-		maxMemoryLength: maxLength,
+		maxMemoryLength:       maxLength,
+		whenRetroRemainMemLen: maxRemainLen,
 	}
 }
 
@@ -59,7 +61,7 @@ func (m *Manager) Load(roomID string) []*genai.Content {
 }
 
 // AddUserMsgAndLoad 记录群友的新发言，并返回用于大模型调用的深拷贝记忆
-func (m *Manager) AddUserMsgAndLoad(roomID string, text string, imgPart ...*genai.Part) []*genai.Content {
+func (m *Manager) AddUserMsgAndLoad(roomID string, isGroup bool, text string, imgPart ...*genai.Part) []*genai.Content {
 	m.getRoomLock(roomID).Lock()
 	defer m.getRoomLock(roomID).Unlock()
 
@@ -71,14 +73,12 @@ func (m *Manager) AddUserMsgAndLoad(roomID string, text string, imgPart ...*gena
 	// 组装当前这句发言的 Parts
 	var currentParts []*genai.Part
 	cachedImgs := m.pullPrivateImageCache(roomID)
-	now := time.Now().Format("2006-01-02 15:04:05")
 	if len(cachedImgs) > 0 {
-		label := fmt.Sprintf("(%s)发送了一组图片：", now)
+		label := "发送了一组图片："
 		currentParts = append(currentParts, genai.Text(label)[0].Parts[0])
 		currentParts = append(currentParts, cachedImgs...)
 	}
 	if text != "" {
-		text = fmt.Sprintf("(%s) %s", now, text)
 		currentParts = append(currentParts, genai.Text(text)[0].Parts[0])
 	}
 	if imgPart != nil {
@@ -104,15 +104,17 @@ func (m *Manager) AddUserMsgAndLoad(roomID string, text string, imgPart ...*gena
 	}
 
 	// 裁切并保存到原始内存
-	history = m.cleanup(roomID, history)
+	if isGroup {
+		history = m.cleanup(roomID, history)
+	}
 	m.chatMemory.Store(roomID, history)
 
-	// 返回一份深拷贝给独立协程，防止指针被并发踩踏
+	// 返回一份深拷贝，防止指针被并发踩踏
 	return m.deepCopy(history)
 }
 
 // AddModelMsg 将大模型的纯净回复写入记忆
-func (m *Manager) AddModelMsg(roomID string, cleanParts []*genai.Part) {
+func (m *Manager) AddModelMsg(roomID string, isGroup bool, cleanParts []*genai.Part) {
 	if len(cleanParts) == 0 {
 		return
 	}
@@ -131,7 +133,9 @@ func (m *Manager) AddModelMsg(roomID string, cleanParts []*genai.Part) {
 	}
 
 	history = append(history, safeModelMsg)
-	history = m.cleanup(roomID, history)
+	if isGroup {
+		history = m.cleanup(roomID, history)
+	}
 	m.chatMemory.Store(roomID, history)
 }
 
@@ -315,12 +319,12 @@ func (m *Manager) appendContentSafely(history []*genai.Content, newContent *gena
 // 获取旧记忆，返回旧记忆与记忆数量
 func (m *Manager) GetOldHistory(history []*genai.Content) ([]*genai.Content, int) {
 	totalLen := m.GetHistoryLen(history)
-	if totalLen <= 6 {
+	if totalLen <= m.whenRetroRemainMemLen {
 		return nil, 0
 	}
 	var h []*genai.Content
 	contentlLen := len(history)
-	targetLen := totalLen - 6
+	targetLen := totalLen - m.whenRetroRemainMemLen
 	if targetLen <= 0 {
 		return nil, 0
 	}
@@ -358,11 +362,26 @@ func (m *Manager) GetHistoryLen(history []*genai.Content) int {
 	return totalLength
 }
 
+func (m *Manager) ForceCleanupAndStore(roomID string) {
+	m.getRoomLock(roomID).Lock()
+	defer m.getRoomLock(roomID).Unlock()
+
+	if val, ok := m.chatMemory.Load(roomID); ok {
+		history := val.([]*genai.Content)
+		history = m.purgeSlidingWindow(history)
+		m.chatMemory.Store(roomID, history)
+	}
+}
+
 // 滑动窗口裁剪逻辑
 func (m *Manager) cleanup(roomID string, history []*genai.Content) []*genai.Content {
 	if _, summarizing := m.summarizingRooms.Load(roomID); summarizing {
 		return history
 	}
+	return m.purgeSlidingWindow(history)
+}
+
+func (m *Manager) purgeSlidingWindow(history []*genai.Content) []*genai.Content {
 	totalLength := m.GetHistoryLen(history)
 	for totalLength > m.maxMemoryLength {
 		if history[0].Role == "user" && len(history[0].Parts) > 1 {

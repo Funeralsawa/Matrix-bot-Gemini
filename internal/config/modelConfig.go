@@ -9,6 +9,7 @@ import (
 type ModelConfig struct {
 	API_KEY          string                       `yaml:"API_KEY"`
 	Model            string                       `yaml:"model"`
+	PrefixToCall     string                       `yaml:"prefixToCall"`
 	MaxOutputToken   int32                        `yaml:"maxOutputToken"`
 	AlargmTokenCount int32                        `yaml:"alargmTokenCount"`
 	UseInternet      bool                         `yaml:"useInternet"`

@@ -159,7 +159,7 @@ func (c *Client) imageHandel(ctx context.Context, evt *event.Event, originalReq 
 				InlineData: &genai.Blob{MIMEType: mime, Data: imgData},
 			}
 			if isSticker {
-				req = fmt.Sprintf("(发送了一张贴纸 %s)", filename)
+				req = fmt.Sprintf("(Send a sticker %s)", filename)
 			} else {
 				req = c.sniffImageCaption(req, filename) // 嗅探并清理常规图片文件名占位符
 			}
@@ -300,7 +300,10 @@ func (c *Client) fetchAndDecryptRemoteEvent(ctx context.Context, roomID id.RoomI
 }
 
 func (c *Client) checkMention(evt *event.Event, quote, reply string) bool {
-	if strings.Contains(reply, string(c.client.UserID)) || strings.Contains(reply, "!c") {
+	if strings.Contains(reply, string(c.client.UserID)) {
+		return true
+	}
+	if strings.Contains(reply, c.cfg.Model.PrefixToCall) {
 		return true
 	}
 	regexEngine := regexp.MustCompile(`<([^>]+)>`)
@@ -325,7 +328,7 @@ func (c *Client) cleanMentionAndCmd(raw string) string {
 	mentionPattern := `\[.*?\]\(https://matrix\.to/#/` + regexp.QuoteMeta(string(c.client.UserID)) + `\)`
 	re := regexp.MustCompile(mentionPattern)
 	res := re.ReplaceAllString(raw, "")
-	res = strings.ReplaceAll(res, "!c ", "")
+	res = strings.ReplaceAll(res, c.cfg.Model.PrefixToCall, "")
 	return strings.TrimSpace(res)
 }
 
@@ -333,9 +336,9 @@ func (c *Client) sniffImageCaption(req, filename string) string {
 	lower := strings.ToLower(req)
 	isFilename := (strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".jpeg")) && !strings.Contains(req, " ")
 	if len(req) == 0 || isFilename {
-		return fmt.Sprintf("(发送了一张图片 %s)", filename)
+		return fmt.Sprintf("(Send a picture %s)", filename)
 	}
-	return fmt.Sprintf("(发送了一张图片 %s 并配文) %s ", filename, req)
+	return fmt.Sprintf("(Send a picture %s with caption) %s ", filename, req)
 }
 
 // 资料自愈支持

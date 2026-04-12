@@ -67,10 +67,10 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 	msgCtxs, err := r.matrix.ParseMessage(ctx, evt, 1)
 	if err != nil {
 		if err.Error() != "not a message event" && err.Error() != "Not support of gif image." {
-			str := "用户：" + evt.Sender.String() + "\n"
-			str += "房间：" + evt.RoomID.String() + "\n"
-			str += "时间：" + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
-			str += "错误：" + "Failed to parse message: " + err.Error()
+			str := "user: " + evt.Sender.String() + "\n"
+			str += "room: " + evt.RoomID.String() + "\n"
+			str += "time: " + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
+			str += "error: " + "Failed to parse message: " + err.Error()
 
 			_ = r.matrix.SendText(ctx, evt.RoomID, "Sorry, I need rest.Pls try again later.")
 			_ = r.logger.Log("error", "Failed to parse message: "+err.Error(), logger.Options{})
@@ -99,21 +99,21 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		// 私聊特殊的连续发图合并逻辑
 		isPureImageOrSticker := false
 		if currentCtx.ImagePart != nil {
-			matched, _ := regexp.MatchString(`^\(发送了一张(图片|贴纸)[^)]*\)\s*$`, currentCtx.Text)
+			matched, _ := regexp.MatchString(`^\(Send a (picture|sticker)[^)]*\)\s*$`, currentCtx.Text)
 			isPureImageOrSticker = matched
 		}
 
 		if isPureImageOrSticker {
 			// 委托 Memory 领域暂存当前这张图
 			imgCount := r.memory.AddPrivateImageCache(roomID, currentCtx.ImagePart)
-			str := fmt.Sprintf("收到 %d 张图。请在 5 分钟内补充文字说明。", imgCount)
+			str := fmt.Sprintf("Receive picture %d.Please provide a written description within 5 minutes.", imgCount)
 			_ = r.matrix.SendText(ctx, id.RoomID(roomID), str)
 			return
 		}
 	}
 
 	// 5. 委托 Memory 领域：记录群友说的话，并取出安全的上下文深拷贝
-	history := r.memory.AddUserMsgAndLoad(roomID, finalText, finalImages...)
+	history := r.memory.AddUserMsgAndLoad(roomID, isGroup, finalText, finalImages...)
 
 	// 6. 如果没有关键字，只记入记忆
 	if !currentCtx.IsMentioned {
@@ -127,9 +127,9 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 
 	// 高频拦截
 	if !r.rateManager.AllowRequest(sender) {
-		str := "拦截到高频请求：\n"
-		str += "房间：" + roomID + "\n"
-		str += "用户：" + sender
+		str := "Intercepting high-frequency requests：\n"
+		str += "room: " + roomID + "\n"
+		str += "user: " + sender
 		r.matrix.SendText(ctx, evt.RoomID, "Sorry, I need rest.Please try again later.")
 		errs := r.matrix.SendToLogRoom(ctx, str)
 		for _, err := range errs {
@@ -140,7 +140,7 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 	}
 
 	// 7. 开启独立工作协程，不阻塞 Matrix 的主接收线程
-	go func(safeHistory []*genai.Content, text string, sender id.UserID, rID id.RoomID) {
+	go func(safeHistory []*genai.Content, text string, sender id.UserID, rID id.RoomID, isGroup bool) {
 		bgCtx := context.Background()
 
 		// 判断联网次数是否耗光
@@ -152,30 +152,31 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		// 委托 LLM 领域：发起思考与生成
 		res, usage, err := r.llm.Generate(bgCtx, safeHistory, dynamicConfig)
 		if err != nil {
-			str := "用户：" + sender.String() + "\n"
-			str += "房间：" + rID.String() + "\n"
-			str += "请求：" + text + "\n"
-			str += "时间：" + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
+			str := "user: " + sender.String() + "\n"
+			str += "room: " + rID.String() + "\n"
+			str += "request: " + text + "\n"
+			str += "time: " + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
 
 			errMsg := err.Error()
 
 			isLocalTimeout := errors.Is(err, context.DeadlineExceeded)
 			isRemoteTimeout := strings.Contains(errMsg, "DEADLINE_EXCEEDED") || strings.Contains(errMsg, "504")
 			if isLocalTimeout || isRemoteTimeout {
-				str += "大模型调用超时！"
+				str += "LLM call timed out!"
 				_ = r.matrix.SendText(bgCtx, rID, "Network congestion.Please try again later.")
 				_ = r.logger.Log("error", "Call LLM time out.", logger.Options{})
 			} else {
 				_ = r.matrix.SendText(bgCtx, rID, "Sorry, I need rest.Please try again later")
 				_ = r.logger.Log("error", fmt.Sprintf("Gemini meet an error: %s", err.Error()), logger.Options{})
 
-				str += "错误：" + err.Error()
+				str += "error: " + err.Error()
 			}
 
 			errs := r.matrix.SendToLogRoom(bgCtx, str)
 			for _, err := range errs {
 				str := "Sending log to log-room error: " + err.Error()
 				_ = r.logger.Log("error", str, logger.Options{})
+				r.matrix.SendToLogRoom(ctx, str)
 			}
 			return
 		}
@@ -187,7 +188,7 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 
 		// 记录日志
 		tokenConsume := fmt.Sprintf(
-			" | 输入%d 输出%d 总计消耗%d | %v",
+			" | input %d output %d total %d | %v",
 			usage.Input,
 			usage.Output,
 			usage.Think+usage.Input+usage.Output,
@@ -198,12 +199,11 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		// 委托 Billing 领域：安全地记账
 		r.billing.Record(usage.Input, usage.Output, usage.Think)
 		if r.billing.CheckAlarm(usage.Input + usage.Output + usage.Think) {
-			str := "用量警报！\n"
-			str += "用户：" + sender.String() + "\n"
-			str += "房间：" + rID.String() + "\n"
-			str += "请求：" + text + "\n"
-			str += "时间: " + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
-			str += "Token 账单单次达到警报值！\n"
+			str := "Dosage Alert!\n"
+			str += "user: " + sender.String() + "\n"
+			str += "room: " + rID.String() + "\n"
+			str += "request: " + text + "\n"
+			str += "time: " + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
 			str += tokenConsume
 			errs := r.matrix.SendToLogRoom(bgCtx, str)
 			for _, err := range errs {
@@ -211,54 +211,25 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 			}
 		}
 
-		// 9. 委托 Memory 领域：将大模型的纯净回复写入记忆
-		r.memory.AddModelMsg(rID.String(), res.CleanParts)
-
-		// 10. 确认是否需要执行记忆回传算法
+		// 9. 确认是否需要执行记忆回传算法
 		nowHistoryLen := r.memory.GetHistoryLen(safeHistory)
 		needMemoryRetrospection := nowHistoryLen >= r.cfg.Client.MaxMemoryLength && !isGroup
 		if needMemoryRetrospection && r.memory.TryLockRoomSummarization(rID) {
 			oldH, summarizedPartCount := r.memory.GetOldHistory(safeHistory)
-			go func(oldH []*genai.Content, sumCount int, roomID id.RoomID) {
-				defer r.memory.UnlockRoomSummarization(roomID)
-				bgCtx := context.Background()
-				str := "简要总结这段聊天记录的内容，不超过300字。"
-				dynamicConfig := r.cfg.Model.Config
-				if r.quota.CheckAndGetRemaining() <= 0 {
-					dynamicConfig = r.llm.GetConfigWithoutSearch()
-				}
-				dynamicConfig.SystemInstruction = genai.Text(str)[0]
-				var res *llm.GenerateResult
-				var usage *llm.TokenUsage
-				var err error
-				for retry := 0; retry < 3; retry++ {
-					res, usage, err = r.llm.Generate(bgCtx, oldH, dynamicConfig)
-					if err != nil {
-						time.Sleep(time.Second * 2)
-						continue
-					}
-					break
-				}
-				if res.UsedSearch {
-					r.quota.Consume()
-				}
-				r.billing.Record(usage.Input, usage.Output, usage.Think)
-				err = r.memory.MemoryRetrospection(roomID, res.CleanParts, sumCount)
-				if err != nil {
-					str := fmt.Sprintf("Memort Retrospection for room %s failed: %v", evt.RoomID, err)
-					r.logger.Log("error", str, logger.Options{})
-				}
-			}(oldH, summarizedPartCount, rID)
+			go r.ExecuteMemoryRetrospection(oldH, summarizedPartCount, rID)
 		}
+
+		// 10. 委托 Memory 领域：将大模型的纯净回复写入记忆
+		r.memory.AddModelMsg(rID.String(), isGroup, res.CleanParts)
 
 		// 11. 委托 Matrix 领域：将富文本渲染并发送到房间
 		err = r.matrix.SendMarkdown(bgCtx, rID, res.RawText)
 		if err != nil {
-			str := "用户：" + sender.String() + "\n"
-			str += "房间：" + rID.String() + "\n"
-			str += "请求：" + text + "\n"
-			str += "时间：" + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
-			str += "错误：" + "Failed to send rich message to room: " + err.Error()
+			str := "user: " + sender.String() + "\n"
+			str += "room: " + rID.String() + "\n"
+			str += "request: " + text + "\n"
+			str += "time: " + time.UnixMilli(evt.Timestamp).Format("2006-01-02 15:04:05") + "\n"
+			str += "error: " + "Failed to send rich message to room: " + err.Error()
 			_ = r.matrix.SendText(bgCtx, rID, "sorry, I need rest, please try again later.")
 			_ = r.logger.Log("error", "Failed to send rich message to room: "+err.Error(), logger.Options{})
 			errs := r.matrix.SendToLogRoom(bgCtx, str)
@@ -268,7 +239,7 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 			}
 			return
 		}
-	}(history, currentCtx.Text, evt.Sender, evt.RoomID)
+	}(history, currentCtx.Text, evt.Sender, evt.RoomID, isGroup)
 }
 
 // HandleMember 专门处理 m.room.member 事件（原 evtMember.go 的终极进化版）

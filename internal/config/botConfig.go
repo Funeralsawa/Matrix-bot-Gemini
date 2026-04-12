@@ -33,7 +33,9 @@ func NewBotConfig() (cfg *BotConfig) {
 	if err != nil {
 		log.Fatalf("config.yaml can't unmarshal: %v", err)
 	}
-
+	if cfg.Client.MaxMemoryLength <= cfg.Client.WhenRetroRemainMemLen {
+		log.Fatalf("config.yaml maxMemoryLength can not bigger than whenRetroRemainMemLen.")
+	}
 	soulPath := filepath.Join(cfg.WorkDir, "soul.md")
 	soulData, err := os.ReadFile(soulPath)
 	if err != nil {

@@ -81,12 +81,12 @@ func NewClient(botCfg *config.BotConfig) (*Client, error) {
 	}, nil
 }
 
-// GetConfigWithoutSearch 返回一个去除了 Tools 工具的浅拷贝配置
+// GetConfigWithoutSearch 返回一个去除了 Tools 工具的深拷贝配置
 func (c *Client) GetConfigWithoutSearch() *genai.GenerateContentConfig {
 	if c.cfg.Config == nil {
 		return nil
 	}
-	temp := *c.cfg.Config // 浅拷贝
+	temp := *c.cfg.Config // 深拷贝
 	temp.Tools = nil
 	return &temp
 }

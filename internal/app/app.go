@@ -31,7 +31,7 @@ type App struct {
 
 func NewApp(cfg *config.BotConfig) (*App, error) {
 	// 初始化纯内存领域
-	memMgr := memory.NewManager(cfg.Client.MaxMemoryLength)
+	memMgr := memory.NewManager(cfg.Client.MaxMemoryLength, cfg.Client.WhenRetroRemainMemLen)
 
 	// 初始化账单
 	billSys := billing.NewSystem(cfg.Model.AlargmTokenCount, cfg.WorkDir)
