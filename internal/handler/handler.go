@@ -143,6 +143,29 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 	go func(safeHistory []*genai.Content, text string, sender id.UserID, rID id.RoomID, isGroup bool) {
 		bgCtx := context.Background()
 
+		// 发送已读回执
+		err := r.matrix.MarkRead(bgCtx, rID, evt.ID)
+		if err != nil {
+			r.logger.Log("error", "Failed to send read receipt: "+err.Error(), logger.Options{})
+		}
+
+		// 模拟人类输入
+		done := make(chan struct{})
+		go func() {
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+
+			select {
+			case <-done:
+				return
+			case <-timer.C:
+				_ = r.matrix.UserTyping(bgCtx, rID, true, r.cfg.Model.TimeOutWhen)
+				<-done
+				_ = r.matrix.UserTyping(bgCtx, rID, false, 0)
+			}
+		}()
+		defer close(done)
+
 		// 判断联网次数是否耗光
 		var dynamicConfig *genai.GenerateContentConfig
 		if r.quota.CheckAndGetRemaining() <= 0 {
@@ -223,7 +246,7 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		r.memory.AddModelMsg(rID.String(), isGroup, res.CleanParts)
 
 		// 11. 委托 Matrix 领域：将富文本渲染并发送到房间
-		err = r.matrix.SendMarkdown(bgCtx, rID, res.RawText)
+		err = r.matrix.SendMarkdownWithMath(bgCtx, rID, res.RawText)
 		if err != nil {
 			str := "user: " + sender.String() + "\n"
 			str += "room: " + rID.String() + "\n"

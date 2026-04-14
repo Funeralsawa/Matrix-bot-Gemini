@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"nozomi/internal/config"
 
@@ -168,8 +170,94 @@ func (c *Client) imageHandel(ctx context.Context, evt *event.Event, originalReq 
 	return imagePart, req, filename, false, nil
 }
 
+// 已读回执
+func (c *Client) MarkRead(ctx context.Context, roomID id.RoomID, evtID id.EventID) error {
+	return c.client.MarkRead(ctx, roomID, evtID)
+}
+
+// 模拟人类的输入
+// typing: true 表示正在输入，false 表示停止输入
+// timeout: 持续时间
+func (c *Client) UserTyping(ctx context.Context, roomID id.RoomID, typing bool, timeout time.Duration) error {
+	_, err := c.client.UserTyping(ctx, roomID, typing, timeout)
+	return err
+}
+
+// 发送一条纯文本信息
+func (c *Client) SendText(ctx context.Context, roomID id.RoomID, text string) error {
+	_, err := c.client.SendText(ctx, roomID, text)
+	return err
+}
+
+func (c *Client) SendMarkdownWithMath(ctx context.Context, roomID id.RoomID, rawText string) error {
+	// 匹配块级公式 $$...$$
+	var blockMathRegex = regexp.MustCompile(`(?s)\$\$(.*?)\$\$`)
+	// 匹配行内公式 $...$
+	var inlineMathRegex = regexp.MustCompile(`(?s)\$(.*?)\$`)
+
+	mathBlocks := make(map[string]string)
+	mathInlines := make(map[string]string)
+	blockCounter := 0
+	inlineCounter := 0
+
+	// 块级公式
+	textWithoutBlocks := blockMathRegex.ReplaceAllStringFunc(rawText, func(match string) string {
+		formula := blockMathRegex.FindStringSubmatch(match)[1]
+		formula = strings.TrimSpace(formula)
+		placeholder := fmt.Sprintf("%%BLOCK_MATH_%d%%", blockCounter)
+
+		// HTML 转义，防止公式中的 < 或 > 破坏标签
+		escapedFormula := html.EscapeString(formula)
+
+		// MSC2191 块级结构
+		htmlStr := fmt.Sprintf(`<div data-mx-maths="%s"><code>$$%s$$</code></div>`, escapedFormula, escapedFormula)
+		mathBlocks[placeholder] = htmlStr
+		blockCounter++
+		return "\n\n" + placeholder + "\n\n"
+	})
+
+	// 行内公式
+	safeText := inlineMathRegex.ReplaceAllStringFunc(textWithoutBlocks, func(match string) string {
+		formula := inlineMathRegex.FindStringSubmatch(match)[1]
+		formula = strings.TrimSpace(formula)
+		placeholder := fmt.Sprintf("%%INLINE_MATH_%d%%", inlineCounter)
+
+		escapedFormula := html.EscapeString(formula)
+
+		// MSC2191 行内结构
+		htmlStr := fmt.Sprintf(`<span data-mx-maths="%s"><code>$%s$</code></span>`, escapedFormula, escapedFormula)
+		mathInlines[placeholder] = htmlStr
+		inlineCounter++
+		return placeholder
+	})
+
+	parsedContent := c.renderMarkdown(safeText)
+
+	finalHTML := parsedContent.FormattedBody
+	if finalHTML == "" {
+		finalHTML = html.EscapeString(safeText)
+	}
+	for placeholder, mathHTML := range mathBlocks {
+		finalHTML = strings.Replace(finalHTML, placeholder, mathHTML, 1)
+	}
+	for placeholder, mathHTML := range mathInlines {
+		finalHTML = strings.Replace(finalHTML, "<p>"+placeholder+"</p>", mathHTML, 1)
+		finalHTML = strings.Replace(finalHTML, placeholder, mathHTML, 1)
+	}
+
+	content := event.MessageEventContent{
+		MsgType:       event.MsgText,
+		Body:          rawText,
+		Format:        event.FormatHTML,
+		FormattedBody: finalHTML,
+	}
+
+	_, err := c.client.SendMessageEvent(ctx, roomID, event.EventMessage, content)
+	return err
+}
+
 // SendMarkdown 封装 HTML 渲染与格式清洗
-func (c *Client) SendMarkdown(ctx context.Context, roomID id.RoomID, rawText string) error {
+func (c *Client) renderMarkdown(rawText string) event.MessageEventContent {
 	richMsg := format.RenderMarkdown(rawText, true, false)
 
 	// 清理 <pre> 标签内的多余换行
@@ -187,8 +275,7 @@ func (c *Client) SendMarkdown(ctx context.Context, roomID id.RoomID, rawText str
 	}
 	richMsg.FormattedBody = strings.Join(parts, "<pre>")
 
-	_, err := c.client.SendMessageEvent(ctx, roomID, event.EventMessage, &richMsg)
-	return err
+	return richMsg
 }
 
 // GetJoinedRooms 获取当前机器人加入的所有房间 ID
@@ -216,12 +303,6 @@ func (c *Client) GetRoomMemberCount(ctx context.Context, roomID string) (int, er
 // LeaveRoom 退出房间
 func (c *Client) LeaveRoom(ctx context.Context, roomID string) error {
 	_, err := c.client.LeaveRoom(ctx, id.RoomID(roomID))
-	return err
-}
-
-// 发送一条纯文本信息
-func (c *Client) SendText(ctx context.Context, roomID id.RoomID, text string) error {
-	_, err := c.client.SendText(ctx, roomID, text)
 	return err
 }
 
