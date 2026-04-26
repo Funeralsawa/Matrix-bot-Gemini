@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"nozomi/internal/billing"
@@ -16,6 +18,7 @@ import (
 	"nozomi/internal/memory"
 	"nozomi/internal/quota"
 	"nozomi/internal/ratelimit"
+	"nozomi/tools"
 
 	"google.golang.org/genai"
 	"maunium.net/go/mautrix/event"
@@ -23,15 +26,16 @@ import (
 )
 
 type Router struct {
-	matrix      *matrix.Client
-	llm         *llm.Client
-	memory      *memory.Manager
-	billing     *billing.System
-	cfg         *config.BotConfig
-	logger      *logger.Logger
-	quota       *quota.Manager
-	rateManager *ratelimit.RateManager
-	bootTime    time.Time // 用于过滤启动前的历史陈旧消息
+	matrix           *matrix.Client
+	llm              *llm.Client
+	memory           *memory.Manager
+	billing          *billing.System
+	cfg              *config.BotConfig
+	logger           *logger.Logger
+	quota            *quota.Manager
+	rateManager      *ratelimit.RateManager
+	bootTime         time.Time // 用于过滤启动前的历史陈旧消息
+	pendingApprovals sync.Map  // map[tools.Task]chan bool
 }
 
 func NewRouter(m *matrix.Client, l *llm.Client, mem *memory.Manager, b *billing.System, cfg *config.BotConfig, logger *logger.Logger, quota *quota.Manager, rateManager *ratelimit.RateManager) *Router {
@@ -86,8 +90,15 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 	if msgCtxsLen == 0 {
 		return
 	}
-	finalText, finalImages := r.FormatMessageContexts(msgCtxs, isGroup)
+
 	currentCtx := msgCtxs[len(msgCtxs)-1]
+
+	// 指令检测
+	if r.checkIsPendingTask(ctx, currentCtx.Text, evt.RoomID, evt.Sender) {
+		return
+	}
+
+	finalText, finalImages := r.FormatMessageContexts(msgCtxs, isGroup)
 
 	roomID := evt.RoomID.String()
 	sender := evt.Sender.String()
@@ -176,16 +187,114 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 
 		// Call LLM
 		var (
-			res   *llm.GenerateResult
-			usage *llm.TokenUsage
+			res           *llm.GenerateResult
+			totalUsage    *llm.TokenUsage = new(llm.TokenUsage)
+			maxStep       int             = 10
+			totalCostTime time.Duration
 		)
-		for retry := 0; retry < 2; retry++ {
+		for retry := 0; retry < maxStep; retry++ {
+			var usage *llm.TokenUsage
 			res, usage, err = r.llm.Generate(bgCtx, safeHistory, dynamicConfig)
 			if err != nil {
 				r.logger.Log("error", err.Error(), logger.Options{})
-			} else {
-				break
+				time.Sleep(1 * time.Second)
+				continue
 			}
+			if res.UsedSearch {
+				// 扣减一次额度
+				r.quota.Consume()
+			}
+
+			// token 消耗记录
+			totalUsage.Input += usage.Input
+			totalUsage.Output += usage.Output
+			totalUsage.Think += usage.Think
+
+			// 时间记录
+			totalCostTime += res.CostTime
+
+			if res.FunCall != nil && retry == maxStep-2 {
+				str := "[System: This is the last step. Please summarize the information you have and give a final response now. DO NOT call any more tools.]"
+				safeHistory = append(safeHistory, &genai.Content{
+					Role:  "model",
+					Parts: []*genai.Part{res.FunCall},
+				})
+				safeHistory = append(safeHistory, genai.Text(str)...)
+			} else if res.FunCall != nil && retry < maxStep-2 {
+				fc := res.FunCall
+				var toolResponseContent string
+				var dict map[string]string
+				r.logger.Log("info", "LLM called tool: "+fc.FunctionCall.Name, logger.Options{})
+
+				r.matrix.SendText(bgCtx, rID, "Calling tool: "+fc.FunctionCall.Name)
+
+				switch fc.FunctionCall.Name {
+				case "execute_terminal":
+					hasPower := slices.Contains(r.cfg.Auth.AdminID, sender)
+					if !hasPower {
+						toolResponseContent = "[Error: The sender don't have enough power to call this tool.]"
+						break
+					}
+					if cmd, ok := fc.FunctionCall.Args["command"].(string); ok {
+						r.logger.Log("info", "Execute Command: "+cmd, logger.Options{})
+
+						r.matrix.SendText(bgCtx, rID, "Execute Command: "+cmd)
+
+						dict = tools.TryExecuteTerminal(cmd, rID, sender)
+
+						toolResponseContent = dict["content"]
+
+						if dict["result"] == "dangerous" {
+							str := fmt.Sprintf("**Dangerous command detected**: `%s`\nUsing `/YES [task_id]` or `/NO [task_id]` to determine whether to execute the command.\n`task_id`: `%s`", cmd, dict["task_id"])
+							task := tools.Task{RoomID: rID, SenderID: sender, TaskID: dict["task_id"]}
+							waitChan := make(chan bool, 1)
+							r.pendingApprovals.Store(task, waitChan)
+							r.matrix.SendMarkdownWithMath(bgCtx, rID, str)
+							var approved bool
+							select {
+							case approved = <-waitChan:
+								if approved {
+									dict = tools.ExecuteTerminal(cmd)
+									toolResponseContent = dict["content"]
+								} else {
+									toolResponseContent = "[Error: User refused authorization]"
+								}
+							case <-time.After(3 * time.Minute): // 设定一个超时时间，防止协程永久泄漏
+								approved = false
+								r.matrix.SendText(bgCtx, rID, "Authorization expired and has been automatically cancelled: "+dict["task_id"])
+								toolResponseContent = "[Error: Authorization expired and has been automatically cancelled.]"
+							}
+							r.pendingApprovals.Delete(task)
+							close(waitChan)
+						}
+					} else {
+						toolResponseContent = "[Error: Invalid command argument]"
+					}
+				default:
+					toolResponseContent = "[Error: Unknown tool]"
+				}
+
+				safeHistory = append(safeHistory, &genai.Content{
+					Role:  "model",
+					Parts: []*genai.Part{fc},
+				})
+
+				safeHistory = append(safeHistory, &genai.Content{
+					Role: "user",
+					Parts: []*genai.Part{
+						{
+							FunctionResponse: &genai.FunctionResponse{
+								ID:       fc.FunctionCall.ID,
+								Name:     fc.FunctionCall.Name,
+								Response: map[string]any{"result": toolResponseContent},
+							},
+						},
+					},
+				})
+
+				continue
+			}
+			break
 		}
 		if err != nil {
 			str := "user: " + sender.String() + "\n"
@@ -217,24 +326,19 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 			return
 		}
 
-		if res.UsedSearch {
-			// 扣减一次额度
-			r.quota.Consume()
-		}
-
 		// 记录日志
 		tokenConsume := fmt.Sprintf(
 			" | input %d output %d total %d | %v",
-			usage.Input,
-			usage.Output,
-			usage.Think+usage.Input+usage.Output,
-			res.CostTime,
+			totalUsage.Input,
+			totalUsage.Output,
+			totalUsage.Think+totalUsage.Input+totalUsage.Output,
+			totalCostTime,
 		)
 		_ = r.logger.Log("bot", text+tokenConsume, logger.Options{UserID: sender.String(), RoomID: rID.String()})
 
 		// 安全地记账
-		r.billing.Record(usage.Input, usage.Output, usage.Think)
-		if r.billing.CheckAlarm(usage.Input + usage.Output + usage.Think) {
+		r.billing.Record(totalUsage.Input, totalUsage.Output, totalUsage.Think)
+		if r.billing.CheckAlarm(totalUsage.Input + totalUsage.Output + totalUsage.Think) {
 			str := "Dosage Alert!\n"
 			str += "user: " + sender.String() + "\n"
 			str += "room: " + rID.String() + "\n"
@@ -256,7 +360,9 @@ func (r *Router) HandleMessage(ctx context.Context, evt *event.Event) {
 		}
 
 		// 将大模型的纯净回复写入记忆
-		r.memory.AddModelMsg(rID.String(), isGroup, res.CleanParts)
+		if res.CleanParts != nil {
+			r.memory.AddModelMsg(rID.String(), isGroup, res.CleanParts)
+		}
 
 		// 将富文本渲染并发送到房间
 		err = r.matrix.SendMarkdownWithMath(bgCtx, rID, res.RawText)

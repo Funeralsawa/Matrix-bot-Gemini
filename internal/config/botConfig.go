@@ -12,6 +12,7 @@ type BotConfig struct {
 	WorkDir string       `yaml:"-"`
 	Client  ClientConfig `yaml:"CLIENT"`
 	Model   ModelConfig  `yaml:"MODEL"`
+	Auth    AuthConfig   `yaml:"Auth"`
 }
 
 func NewBotConfig() (cfg *BotConfig) {

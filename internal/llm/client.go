@@ -9,15 +9,18 @@ import (
 	"time"
 
 	"nozomi/internal/config"
+	"nozomi/tools"
 
 	"google.golang.org/genai"
 )
 
 // GenerateResult 结构化大模型的返回结果
 type GenerateResult struct {
-	RawText    string        // 带有完整排版的原始文本（用于发给 Matrix）
-	CleanParts []*genai.Part // 剔除了思考过程的纯净上下文（用于存入 Memory）
-	UsedSearch bool          // 是否使用了联网搜索
+	OrigRes    *genai.GenerateContentResponse // 原始返回
+	RawText    string                         // 带有完整排版的原始文本（用于发给 Matrix）
+	CleanParts []*genai.Part                  // 剔除了思考过程的纯净上下文（用于存入 Memory）
+	UsedSearch bool                           // 是否使用了联网搜索
+	FunCall    *genai.Part                    // 工具调用
 	CostTime   time.Duration
 }
 
@@ -64,8 +67,9 @@ func NewClient(botCfg *config.BotConfig) (*Client, error) {
 	}
 
 	// 工具与安全审查配置
+	botCfg.Model.Config.Tools = []*genai.Tool{tools.TerminalTool}
 	if botCfg.Model.UseInternet {
-		botCfg.Model.Config.Tools = []*genai.Tool{{GoogleSearch: &genai.GoogleSearch{}}}
+		botCfg.Model.Config.Tools = append(botCfg.Model.Config.Tools, &genai.Tool{GoogleSearch: &genai.GoogleSearch{}})
 	}
 	if !botCfg.Model.SecureCheck {
 		botCfg.Model.Config.SafetySettings = []*genai.SafetySetting{
@@ -87,8 +91,14 @@ func (c *Client) GetConfigWithoutSearch() *genai.GenerateContentConfig {
 	if c.cfg.Config == nil {
 		return nil
 	}
-	temp := *c.cfg.Config // 深拷贝
-	temp.Tools = nil
+	temp := *c.cfg.Config // 浅拷贝
+	var filteredTools []*genai.Tool
+	for _, tool := range c.cfg.Config.Tools {
+		if tool.GoogleSearch == nil {
+			filteredTools = append(filteredTools, tool)
+		}
+	}
+	temp.Tools = filteredTools
 	return &temp
 }
 
@@ -99,11 +109,18 @@ func (c *Client) Generate(ctx context.Context, history []*genai.Content, dynamic
 	timeoutCtx, cancel := context.WithTimeout(ctx, c.cfg.TimeOutWhen)
 	defer cancel()
 
-	// 发起 API 请求
 	reqConf := c.cfg.Config
 	if dynamicConfig != nil {
 		reqConf = dynamicConfig
 	}
+	if reqConf.ToolConfig == nil {
+		reqConf.ToolConfig = &genai.ToolConfig{}
+	}
+
+	// 开启工具混用
+	allow := true
+	reqConf.ToolConfig.IncludeServerSideToolInvocations = &allow
+
 	now := time.Now()
 	resp, err := c.apiClient.Models.GenerateContent(timeoutCtx, c.cfg.Model, history, reqConf)
 	costTime := time.Since(now)
@@ -128,6 +145,38 @@ func (c *Client) Generate(ctx context.Context, history []*genai.Content, dynamic
 		Think:  resp.UsageMetadata.ThoughtsTokenCount,
 	}
 
+	// 检查是否使用了联网搜寻
+	usedSearch := false
+	if len(resp.Candidates) > 0 && resp.Candidates[0].GroundingMetadata != nil {
+		meta := resp.Candidates[0].GroundingMetadata
+		if meta.SearchEntryPoint != nil || len(meta.GroundingChunks) > 0 {
+			usedSearch = true
+		}
+	}
+
+	// 探测模型是否发起了 Function Call
+	var fc *genai.Part
+	if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+		for _, part := range resp.Candidates[0].Content.Parts {
+			if part.FunctionCall != nil {
+				fc = part
+				break
+			}
+		}
+	}
+
+	if fc != nil {
+		result := &GenerateResult{
+			OrigRes:    resp,
+			RawText:    "",
+			CleanParts: nil,
+			UsedSearch: usedSearch,
+			FunCall:    fc,
+			CostTime:   costTime,
+		}
+		return result, usage, nil
+	}
+
 	// 提取文本与格式清洗
 	raw := resp.Text()
 	raw = strings.TrimSpace(raw)
@@ -142,19 +191,12 @@ func (c *Client) Generate(ctx context.Context, history []*genai.Content, dynamic
 		cleanParts = genai.Text("(This is a empty string)")[0].Parts
 	}
 
-	// 检查是否使用了联网搜寻
-	usedSearch := false
-	if len(resp.Candidates) > 0 && resp.Candidates[0].GroundingMetadata != nil {
-		meta := resp.Candidates[0].GroundingMetadata
-		if meta.SearchEntryPoint != nil || len(meta.GroundingChunks) > 0 {
-			usedSearch = true
-		}
-	}
-
 	result := &GenerateResult{
+		OrigRes:    resp,
 		RawText:    raw,
 		CleanParts: cleanParts,
 		UsedSearch: usedSearch,
+		FunCall:    fc,
 		CostTime:   costTime,
 	}
 

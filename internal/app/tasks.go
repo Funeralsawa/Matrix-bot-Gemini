@@ -97,7 +97,7 @@ func (a *App) nonExistRoomCleanupLoop(ctx context.Context) {
 	}
 }
 
-// 账单巡检逻辑
+// 账单巡检
 func (a *App) billingCheckLoop(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -107,10 +107,8 @@ func (a *App) billingCheckLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// 1. 让账单领域去算账，如果有跨天/月，它会交回 []string 格式的报表
 			reports := a.Billing.CheckAndReset()
 
-			// 2. 调度 Matrix 领域，把报表投递到所有的日志管理群
 			for _, report := range reports {
 				errs := a.Matrix.SendToLogRoom(ctx, report)
 				for _, err := range errs {
@@ -125,7 +123,7 @@ func (a *App) profileKeeperLoop(ctx context.Context) {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 
-	// 程序刚启动时，强制执行一次查岗
+	// 程序刚启动时，强制执行一次
 	a.checkAndRestoreProfile()
 
 	for {
@@ -138,7 +136,7 @@ func (a *App) profileKeeperLoop(ctx context.Context) {
 	}
 }
 
-// 核心自愈动作：核对并修复
+// 核对并修复头像与昵称
 func (a *App) checkAndRestoreProfile() {
 	cfgName := a.Config.Client.DisplayName
 	cfgAvatar := a.Config.Client.AvatarURL
@@ -147,7 +145,7 @@ func (a *App) checkAndRestoreProfile() {
 		return
 	}
 
-	// 1. 调用 Matrix 领域：获取当前服务器上的真实情况
+	// 获取当前服务器上的真实情况
 	currentName, currentAvatar, err := a.Matrix.GetProfile()
 	if err != nil {
 		_ = a.Logger.Log("error", "Get profile data : "+err.Error(), logger.Options{})
@@ -158,19 +156,19 @@ func (a *App) checkAndRestoreProfile() {
 	updateName := ""
 	updateAvatar := ""
 
-	// 2. 比对昵称
+	// 比对昵称
 	if cfgName != "" && currentName != cfgName {
 		needsUpdate = true
 		updateName = cfgName
 	}
 
-	// 3. 比对头像
+	// 比对头像
 	if cfgAvatar != "" && currentAvatar != cfgAvatar {
 		needsUpdate = true
 		updateAvatar = cfgAvatar
 	}
 
-	// 4. 执行修复：委托 Matrix 领域重新把头像和名字挂上去
+	// 执行修复
 	if needsUpdate {
 		err := a.Matrix.SetProfile(updateName, updateAvatar)
 		if err != nil {
