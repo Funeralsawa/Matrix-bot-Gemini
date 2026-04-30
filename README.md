@@ -1,79 +1,90 @@
 # Nozomi (希)
 
-[中文文档 (Chinese Version)](./README_ZH.md)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/Nozomi-Project/Nozomi)](https://golang.org)
+[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](https://github.com/Nozomi-Project/Nozomi/releases)
 
-Nozomi is a high-performance, engineering-focused AI Bot framework built with **Go**. It bridges the **Matrix** communication protocol with **Google Gemini** LLMs. Designed for stability and long-term interaction, Nozomi features advanced memory management, multi-modal perception, and industrial-grade monitoring.
+Nozomi is an engineering-focused AI Bot framework bridging **Matrix** and **Google Gemini**. Designed for stability, long-term interaction, and autonomous capability.
 
-## 🌟 Key Features
-
-- **🧠 Memory Retrospection**: Bypasses LLM context limits. When conversation history reaches a threshold, the bot asynchronously generates a summary and folds it back into the context, enabling "infinite" long-term memory.
-- **🖼️ Multi-modal Perception**: Supports mixed image and text contexts. Includes specialized logic for private chat image caching and description merging.
-- **⚙️ Thinking Mode**: Full support for Gemini "Flash Thinking" models, allowing the bot to process complex reasoning before delivering the final response.
-- **🌐 Grounding (Search)**: Integrated Google Search tool. Automatically fetches real-time information when necessary based on search quotas.
-- **💰 Precise Billing & Rate Limiting**: 
-  - Tracks Token usage across Day/Month/Year dimensions (categorized by Input, Output, and Thinking tokens).
-  - Monthly quota management for internet searches.
-  - Token-bucket-based rate limiting to prevent API abuse.
-- **🛡️ Production Ready**:
-  - Fully asynchronous I/O; Matrix sync is never blocked.
-  - Thread-safe core logic with granular mutex locking.
-  - Real-time error reporting to dedicated Matrix log rooms.
-
-## 🏗️ Architecture
-
-The project follows a decoupled domain-driven design:
-
-- `internal/matrix`: Manages protocol events, state synchronization, and Markdown rendering.
-- `internal/llm`: Handles SDK interactions, thinking process extraction, and tool configuration.
-- `internal/memory`: Orchestrates the sliding window history and asynchronous summarization.
-- `internal/billing`: Manages persistent usage statistics and alarm triggers.
-- `internal/handler`: The central router coordinating domain logic and event flow.
+[中文文档](./README_ZH.md)
 
 ## 🚀 Quick Start
 
-1. **Configure**: Fill in your credentials in `configs/config.yaml`.
-2. **Build**: 
-   ```bash
-   make build
-   ```
-3. **Run**:
-   ```bash
-   ./dist/nozomi
-   ```
+1.  **Configure**: Create and edit `configs/config.yaml` based on the template below.
+2.  **Build**: 
+    ```bash
+    make build
+    ```
+3.  **Run**:
+    ```bash
+    ./dist/nozomi
+    ```
+
+## ⚡ Core Capabilities
+
+### 1. Function Calling & Tool Use (v3.1.0)
+- **Secure Terminal**: Executes bash commands with AST-based safety filtering. Dangerous commands (e.g., `rm`) require manual `/YES [task_id]` approval.
+- **Cron Engine**: Schedule recurring LLM tasks directly via chat.
+- **Grounding**: Seamless Google Search integration.
+
+### 2. Memory Retrospection
+Bypasses context limits by asynchronously summarizing old history when the buffer is full, maintaining a coherent long-term memory.
+
+### 3. Perception & Reasoning
+- **Multi-modal**: Native image/text mixed context support.
+- **Thinking Mode**: Full extraction and display of Gemini's reasoning chains.
+
+---
 
 ## 🔧 Configuration Guide
 
+Detailed explanation of `configs/config.yaml`.
+
 ### `CLIENT` Section
-| Key | Description |
-|:---|:---|
-| `homeserverURL` | The URL of your Matrix homeserver (e.g., `https://matrix.org`). |
-| `userID` | The full Matrix ID of the bot (e.g., `@nozomi:example.com`). |
-| `accessToken` | The bot's Matrix access token for authentication. |
-| `deviceID` | An identifier for the session device. |
-| `logRoom` | An array of room IDs where the bot will send error logs and status updates. |
-| `maxMemoryLength` | The maximum number of message "slots" in the sliding window before triggering summarization. |
-| `whenRetroRemainMemLen` | How many recent message slots to keep intact after a summarization occurs. |
-| `avatarURL` | The MXC URI for the bot's avatar. |
-| `displayName` | The display name shown in Matrix rooms. |
-| `databasePassword` | Password for the SQLite/State database encryption (if applicable). |
+| Key | Type | Description | Default/Example |
+|:---|:---:|:---|:---|
+| `homeserverURL` | `string` | The Matrix homeserver API endpoint. | `"https://matrix.org"` |
+| `userID` | `string` | The full Matrix ID for the bot. | `"@nozomi:example.com"` |
+| `accessToken` | `string` | Bot's access token for authentication. | (Obtain from Matrix client) |
+| `deviceID` | `string` | Identifier for the current session. | `"Nozomi-Server"` |
+| `logRoom` | `[]string`| Matrix Room IDs where system logs/errors are pushed. | `[]` |
+| `maxMemoryLength` | `int` | Max message slots in the sliding window before summarization. | `14` |
+| `whenRetroRemainMemLen`| `int` | Recent messages to keep intact after summarization. | `6` |
+| `avatarURL` | `string` | MXC URI for the bot's profile picture. | `""` |
+| `displayName` | `string` | Bot's display name in the Matrix room. | `"希"` |
+| `databasePassword` | `string` | Password for SQLite/State DB encryption. | `"123456"` |
 
 ### `MODEL` Section
-| Key | Description |
-|:---|:---|
-| `API_KEY` | Your Google AI Studio (Gemini) API Key. |
-| `model` | The specific model string (e.g., `gemini-2.0-flash-thinking-exp`). |
-| `prefixToCall` | The keyword prefix required to trigger the bot in group chats (e.g., `!c`). |
-| `maxOutputToken` | Maximum number of tokens allowed in a single model response. |
-| `alargmTokenCount` | Threshold for a "Dosage Alert". Single requests exceeding this will be logged as high-consumption. |
-| `useInternet` | `true/false`. Enables or disables the Google Search tool. |
-| `secureCheck` | `true/false`. If false, safety filters are set to `BLOCK_NONE` for unrestricted output. |
-| `maxMonthlySearch` | Monthly limit for internet search tool calls. |
-| `timeOutWhen` | Strict timeout for the LLM API call (e.g., `40s`). |
-| `includeThoughts` | `true/false`. Whether to request and process the "Thinking" process from the model. |
-| `thinkingBudget` | Token budget for the thinking process (0 for auto). |
-| `thinkingLevel` | Specific reasoning depth level if supported by the model. |
-| `rate` | The sustained request rate allowed per user (requests per second). |
-| `rateBurst` | The maximum number of requests a user can send in a sudden burst. |
+| Key | Type | Description | Default/Example |
+|:---|:---:|:---|:---|
+| `API_KEY` | `string` | Google AI Studio (Gemini) API Key. | (Your Key) |
+| `model` | `string` | Specific Gemini model identifier. | `"gemini-3.1-flash-lite-preview"` |
+| `prefixToCall` | `string` | Trigger prefix in group chats. | `"!c"` |
+| `maxOutputToken` | `int` | Maximum tokens allowed in a single response. | `3000` |
+| `alargmTokenCount` | `int` | Threshold to log a high-consumption warning. | `4000` |
+| `useInternet` | `bool` | Enable/disable the Google Search tool. | `true` |
+| `secureCheck` | `bool` | If `false`, sets safety filters to `BLOCK_NONE`. | `true` |
+| `maxMonthlySearch` | `int` | Monthly quota for search tool calls. | `4000` |
+| `timeOutWhen` | `string` | Hard timeout for LLM API calls. | `"30s"` |
+| `includeThoughts` | `bool` | Whether to process/display the "Thinking" process. | `true` |
+| `thinkingBudget` | `int` | Token budget for reasoning (0 for auto). | `0` |
+| `thinkingLevel` | `string` | Reasoning depth (low/medium/high). | `"high"` |
+| `rate` | `float` | Request rate limit per user (req/sec). | `0.20` |
+| `rateBurst` | `int` | Maximum sudden burst of requests allowed. | `1` |
+
+### `Auth` Section
+| Key | Type | Description | Default/Example |
+|:---|:---:|:---|:---|
+| `adminID` | `[]string` | Users with permission to execute terminal commands. | `[]` |
+
+---
+
+## 🏗️ Architecture
+
+- `internal/matrix`: Protocol sync and event orchestration.
+- `internal/llm`: Gemini SDK integration and tool management.
+- `internal/memory`: Async memory summarization logic.
+- `internal/handler`: Central event routing and function execution.
+- `internal/billing`: Token and quota persistence.
 
 ---
 *Inspired by Nozomi from "Sonny Boy".*

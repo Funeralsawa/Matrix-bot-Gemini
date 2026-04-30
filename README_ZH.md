@@ -1,79 +1,90 @@
 # Nozomi (希)
 
+[![Go Version](https://img.shields.io/github/go-mod/go-version/Nozomi-Project/Nozomi)](https://golang.org)
+[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](https://github.com/Nozomi-Project/Nozomi/releases)
+
+Nozomi 是一个面向工程化的 AI 机器人框架，深度整合 **Matrix** 协议与 **Google Gemini** 模型。专注于稳定性、长期记忆与自主工具调用能力。
+
 [English Version](./README.md)
-
-Nozomi 是一个基于 **Go** 语言开发的高性能、工程化 AI 机器人框架。它深度整合了 **Matrix** 通讯协议与 **Google Gemini** 大语言模型，旨在提供稳定、长期的智能交互体验。Nozomi 具备先进的记忆管理、多模态感知以及工业级的监控能力。
-
-## 🌟 核心特性
-
-- **🧠 记忆回传算法 (Memory Retrospection)**: 突破 LLM 的上下文限制。当对话历史达到设定阈值时，机器人会异步生成摘要并将其回传至上下文，从而实现“无限”的长期记忆。
-- **🖼️ 多模态感知**: 支持图片与文字混合的复杂上下文理解，具备私聊图片暂存与配文合并的特殊处理逻辑。
-- **⚙️ 思考模式 (Thinking Mode)**: 完整支持 Gemini "Flash Thinking" 模型，允许机器人在输出最终答案前进行复杂的推理过程。
-- **🌐 联网搜索增强 (Grounding)**: 集成 Google 搜索工具。根据搜索配额，在必要时自动获取实时信息。
-- **💰 精准账单与限流**: 
-  - 支持按 日/月/年 维度统计 Token 消耗（细分为 输入、输出、思考 Token）。
-  - 具备每月联网搜索次数配额管理。
-  - 基于令牌桶算法的限流机制，有效防止 API 滥用。
-- **🛡️ 生产级稳定性**:
-  - 全异步 I/O 设计，确保 Matrix 消息同步永不阻塞。
-  - 核心逻辑线程安全，采用细粒度的互斥锁控制。
-  - 实时错误报告，关键异常自动推送至指定的 Matrix 日志房间。
-
-## 🏗️ 技术架构
-
-项目采用解耦的领域驱动设计：
-
-- `internal/matrix`: 管理协议事件、状态同步及 Markdown 渲染。
-- `internal/llm`: 处理 SDK 交互、思考过程提取及工具配置。
-- `internal/memory`: 调度滑动窗口记忆与异步总结逻辑。
-- `internal/billing`: 负责持久化的使用量统计与报警触发。
-- `internal/handler`: 中心路由器，协调各领域逻辑与事件流。
 
 ## 🚀 快速开始
 
-1. **配置**: 在 `configs/config.yaml` 中填入你的凭据。
-2. **编译**: 
-   ```bash
-   make build
-   ```
-3. **运行**:
-   ```bash
-   ./dist/nozomi
-   ```
+1.  **配置**: 根据下文指南编辑 `configs/config.yaml`。
+2.  **编译**: 
+    ```bash
+    make build
+    ```
+3.  **运行**:
+    ```bash
+    ./dist/nozomi
+    ```
+
+## ⚡ 核心能力
+
+### 1. 函数调用与工具化 (v3.1.0)
+- **安全终端**: 基于 AST 语法分析的 Bash 命令执行，危险操作（如 `rm`）需通过 `/YES [task_id]` 手动授权。
+- **定时任务**: 直接在对话中创建并管理周期性 LLM 任务（如：每日简报）。
+- **实时搜索**: 集成 Google Search，自动获取最新资讯。
+
+### 2. 记忆回传算法
+通过异步总结对话历史并回传上下文，在不超出窗口限制的前提下，维持长期的逻辑连贯性。
+
+### 3. 感知与推理
+- **多模态**: 原生支持图文混合输入。
+- **思考模式**: 深度支持 Gemini 的推理过程提取与展示。
+
+---
 
 ## 🔧 配置指南
 
-### `CLIENT` 部分 (客户端配置)
-| 配置项 | 说明 |
-|:---|:---|
-| `homeserverURL` | Matrix 家园服务器地址 (例如 `https://matrix.org`)。 |
-| `userID` | 机器人的完整 Matrix ID (例如 `@nozomi:example.com`)。 |
-| `accessToken` | 机器人的 Matrix 访问令牌，用于身份验证。 |
-| `deviceID` | 当前会话的设备标识符。 |
-| `logRoom` | 日志房间 ID 列表，机器人会将错误日志和状态更新发送至此。 |
-| `maxMemoryLength` | 滑动窗口中的最大消息“槽位”数，超过此值将触发记忆总结。 |
-| `whenRetroRemainMemLen` | 触发记忆总结后，保留在上下文中的最近消息槽位数。 |
-| `avatarURL` | 机器人头像的 MXC 链接。 |
-| `displayName` | 机器人在 Matrix 房间中显示的昵称。 |
-| `databasePassword` | 状态数据库加密密码（如适用）。 |
+`configs/config.yaml` 详细参数说明：
 
-### `MODEL` 部分 (模型配置)
-| 配置项 | 说明 |
-|:---|:---|
-| `API_KEY` | Google AI Studio (Gemini) 的 API 密钥。 |
-| `model` | 使用的具体模型名称 (例如 `gemini-2.0-flash-thinking-exp`)。 |
-| `prefixToCall` | 在群聊中触发机器人的关键词前缀 (例如 `!c`)。 |
-| `maxOutputToken` | 模型单次回复允许生成的最大 Token 数量。 |
-| `alargmTokenCount` | “用量报警”阈值。单次请求消耗超过此值将被记录为高消耗。 |
-| `useInternet` | `true/false`。是否启用 Google 搜索工具。 |
-| `secureCheck` | `true/false`。若为 false，安全过滤器将设为 `BLOCK_NONE`，允许输出不受限。 |
-| `maxMonthlySearch` | 每月允许进行联网搜索的次数上限。 |
-| `timeOutWhen` | LLM API 调用的严格超时时间 (例如 `40s`)。 |
-| `includeThoughts` | `true/false`。是否请求并处理模型的“思考过程”。 |
-| `thinkingBudget` | 思考过程的 Token 预算（设为 0 则为自动）。 |
-| `thinkingLevel` | 特定模型支持的推理深度等级。 |
-| `rate` | 每秒允许单个用户发送的持续请求数（限流）。 |
-| `rateBurst` | 允许用户发送的突发请求最大数量。 |
+### `CLIENT` 部分 (客户端)
+| 配置项 | 类型 | 说明 | 默认/示例 |
+|:---|:---:|:---|:---|
+| `homeserverURL` | `string` | Matrix 家园服务器地址。 | `"https://matrix.org"` |
+| `userID` | `string` | 机器人的完整 Matrix ID。 | `"@nozomi:example.com"` |
+| `accessToken` | `string` | 用于身份验证的访问令牌。 | (需从客户端获取) |
+| `deviceID` | `string` | 当前登录设备的标识符。 | `"Nozomi-Server"` |
+| `logRoom` | `[]string`| 系统日志和错误推送的房间 ID 列表。 | `[]` |
+| `maxMemoryLength` | `int` | 滑动窗口最大消息数，超过则触发总结。 | `14` |
+| `whenRetroRemainMemLen`| `int` | 记忆回传后保留的最近消息条数。 | `6` |
+| `avatarURL` | `string` | 机器人头像的 MXC 链接。 | `""` |
+| `displayName` | `string` | 机器人在 Matrix 房间显示的昵称。 | `"希"` |
+| `databasePassword` | `string` | 状态数据库 (SQLite) 的加密密码。 | `"123456"` |
+
+### `MODEL` 部分 (模型)
+| 配置项 | 类型 | 说明 | 默认/示例 |
+|:---|:---:|:---|:---|
+| `API_KEY` | `string` | Google AI Studio (Gemini) API 密钥。 | (你的 API Key) |
+| `model` | `string` | 使用的 Gemini 具体模型名称。 | `"gemini-3.1-flash-lite-preview"` |
+| `prefixToCall` | `string` | 群聊中触发机器人的关键词前缀。 | `"!c"` |
+| `maxOutputToken` | `int` | 单次回复生成的最大 Token 数。 | `3000` |
+| `alargmTokenCount` | `int` | 高能耗报警阈值，超过此值会记录日志。 | `4000` |
+| `useInternet` | `bool` | 是否启用 Google 搜索工具。 | `true` |
+| `secureCheck` | `bool` | 若为 `false`，安全过滤器设为 `BLOCK_NONE`。 | `true` |
+| `maxMonthlySearch` | `int` | 每月允许进行联网搜索的次数上限。 | `4000` |
+| `timeOutWhen` | `string` | LLM API 调用的硬性超时时间。 | `"30s"` |
+| `includeThoughts` | `bool` | 是否处理并展示模型的推理思考过程。 | `true` |
+| `thinkingBudget` | `int` | 思考过程的 Token 预算 (0 为自动)。 | `0` |
+| `thinkingLevel` | `string` | 推理深度等级 (low/medium/high)。 | `"high"` |
+| `rate` | `float` | 单个用户每秒允许发送的请求数。 | `0.20` |
+| `rateBurst` | `int` | 允许的单次突发请求最大数量。 | `1` |
+
+### `Auth` 部分 (鉴权)
+| 配置项 | 类型 | 说明 | 默认/示例 |
+|:---|:---:|:---|:---|
+| `adminID` | `[]string` | 拥有管理员权限（如执行终端工具）的用户 ID。 | `[]` |
 
 ---
-*致敬《漂流少年》(Sonny Boy) 中的“希”。*
+
+## 🏗️ 技术架构
+
+- `internal/matrix`: 协议同步与事件编排。
+- `internal/llm`: Gemini SDK 集成与工具管理。
+- `internal/memory`: 异步记忆总结逻辑。
+- `internal/handler`: 中心事件路由与函数执行。
+- `internal/billing`: Token 与配额的持久化统计。
+
+---
+*致敬《漂流少年》(Sonny Boy) 中的“希”。直面现实，不拘泥于形式。*
