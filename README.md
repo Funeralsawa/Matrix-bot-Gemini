@@ -1,7 +1,7 @@
 # Nozomi (希)
 
-[![Go Version](https://img.shields.io/github/go-mod/go-version/Nozomi-Project/Nozomi)](https://golang.org)
-[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](https://github.com/Nozomi-Project/Nozomi/releases)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/Funeralsawa/Matrix-bot-Gemini](https://github.com/Funeralsawa/Matrix-bot-Gemini)
+[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](https://github.com/Funeralsawa/Matrix-bot-Gemini/releases)
 
 Nozomi is an engineering-focused AI Bot framework bridging **Matrix** and **Google Gemini**. Designed for stability, long-term interaction, and autonomous capability.
 
